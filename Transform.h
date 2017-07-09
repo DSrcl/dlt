@@ -1,17 +1,36 @@
 #ifndef TRANSFORM_H
 #define TRANSFORM_H
 
+#include <vector>
 #include "Layout.h"
 
+namespace TransformParams {
+  // probability of choosing a root struct instead of descending
+  // while selecting sub-layout
+  const float PRoot = 0.5;
+}
+
 //
-// interface that provides a mapping from layout -> layout
-//
-// TODO: this currently only applies to the *root* node of a layout tree
+// a mapping from layout -> layout
 //
 class LayoutTransform {
+  // randomly walk down the layout to select a sublayout and remember nodes preceding the node selected
+  LayoutDataType *select(LayoutDataType *Layout, std::vector<LayoutDataType *> &Parents) const;
 public:
-  virtual std::shared_ptr<LayoutDataType>
-  apply(const LayoutDataType &) const = 0;
+  virtual void transform(LayoutDataType *) const = 0;
+  std::unique_ptr<LayoutDataType> apply(const LayoutDataType &) const;
+};
+
+//
+// randomly select one from a pool of transformations and apply it
+//
+class TransformPool {
+  std::vector<float> Probs;
+  std::vector<std::unique_ptr<LayoutTransform>> Transforms;
+public:
+  // add a transformation to the pool, Prob is the probability with which we apply it
+  void addTransform(std::unique_ptr<LayoutTransform> Transform, float Prob); 
+  std::unique_ptr<LayoutDataType> apply(const LayoutDataType &) const;
 };
 
 //
@@ -21,12 +40,11 @@ public:
 //  the transform interface consistent
 //
 class FactorTransform : public LayoutTransform {
-  // factor with which we factor (my english is so good it makes me cringe)
   ExprPtr Factor;
 
 public:
   FactorTransform(unsigned TheFactor) : Factor(Const(TheFactor)) {}
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 //
@@ -35,7 +53,7 @@ public:
 //
 class SOATransform : public LayoutTransform {
 public:
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 //
@@ -45,7 +63,7 @@ public:
 //
 class AOSTransform : public LayoutTransform {
 public:
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 //
@@ -54,7 +72,7 @@ public:
 //
 class StructTransform : public LayoutTransform {
 public:
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 //
@@ -64,7 +82,7 @@ public:
 //
 class StructFlattenTransform : public LayoutTransform {
 public:
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 //
@@ -72,7 +90,7 @@ public:
 //
 class InterchangeTransform : public LayoutTransform {
 public:
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 //
@@ -80,7 +98,7 @@ public:
 //
 class SwapTransform : public LayoutTransform {
 public:
-  std::shared_ptr<LayoutDataType> apply(const LayoutDataType &) const override;
+  void transform(LayoutDataType *) const override;
 };
 
 #endif

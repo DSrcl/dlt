@@ -38,29 +38,28 @@
 
 //
 // ========== RAAAAAAAAAAAAAAAAAAAAAAAAAMBLING ==========
-// Maybe the mere existence of RefRecord for a DSNode should signify
-// the memory object covered by it refers to targets, but References means
-// further that the range covered by that node (0...size) refers to any targets?
-// OR think of something similar to how DSNodeHandle relates to DSNode
-// Um.. they are the same..
+// 1) Maybe we should treat nodes that refers to target as the same way we treat targets?
+// perhaps with something TargetRefs? The primary rationale here is so that we
+// can track the actual size of these nodes acurately
 //
-// Maybe we should treat reference to target as the same way we treat targets?
-// perhaps with something TargetRefs?
-//
-// When getting new type for GEP, relying on the input type is actually wrong
+// 2) When getting new type for GEP, relying on the input type is wrong.
 // e.g. when `{ char[offset_of_3rd_elem], int }, something, 0, 1 }` is used
 // instead of
 // `gep { int, int *ptr2target, int }, something, 0, 3`.
-// -- for this helper function that, given old offset returns offset after
-// triple conversion
-// will work. With this the example will be translated into
+// -- Need a helper function that takes old offset and returns offset after
+// triple conversion.
+// will work. With this, the example above will be translated into
 // `gep {char[offset_of_3rd_elem_after_conv], something, 0, 1}`
 // <<<< can probably put this off though, considering most program are not
-// psychotic as this
+// pathological as this
 //
-// `shouldCloneFunction` doesn't work when in cases like where a target ref is
+// 3) `shouldCloneFunction` doesn't work when in cases like where a target ref is
 // allocated
 // in a malloc wrapper
+//
+// 4) rethink the algorithm for applyTransformation. The focus here should be
+// on tracking targets and nodes that refers to them. Maybe the legality can be
+// done in one pass
 //
 
 using namespace llvm;
@@ -231,7 +230,7 @@ class LayoutTuner : public ModulePass {
   // ============================
   //
   // Say we want to triple-convert the target, v->data, in foo.
-  // When we traverse the call graph to make_vec (say we use BU pass),
+  // When we traverse the call graph to make_vec (say we use BU),
   // in the context of make_vec, we don't know if the expression
   // `new Vec` refers to our target since the DSNode of v->data is not
   // even in the DSGraph of make_vec. To fix this, when we begin our
@@ -586,7 +585,7 @@ LayoutLowering::LayoutLowering(const DSNode *Target,
     }
 
     auto *Struct = cast<LayoutStruct>(Layout);
-    for (auto Field : Struct->getFields()) {
+    for (auto &Field : Struct->getFields()) {
       int ChildFieldId = Field.first;
       auto *ChildLayout = Field.second.get();
       Parents[ChildLayout] = Layout;
@@ -658,7 +657,7 @@ Value *LayoutLowering::ComputeAddress(IndexTriple Triple, unsigned Offset,
       int Offset = -1, i = 0;
       auto Fields = Struct->getFields();
       auto *NextNode = Path[PathIdx+1];
-      for (auto Field : Fields) {
+      for (auto &Field : Fields) {
         if (NextNode == Field.second.get()) {
           Offset = i;
           break;
@@ -924,6 +923,32 @@ bool LayoutTuner::runOnModule(Module &M) {
   std::vector<Function *> Fns;
   TargetMapTy TargetsInGG;
 
+  TransformPool TP;
+  TP.addTransform(std::make_unique<FactorTransform>(4), 0.05);
+  TP.addTransform(std::make_unique<FactorTransform>(8), 0.05);
+  TP.addTransform(std::make_unique<FactorTransform>(16), 0.05);
+  TP.addTransform(std::make_unique<FactorTransform>(32), 0.05); // 0.2
+  TP.addTransform(std::make_unique<StructTransform>(), 0.15); // 0.35
+  TP.addTransform(std::make_unique<StructFlattenTransform>(), 0.15); // 0.5
+  TP.addTransform(std::make_unique<SOATransform>(), 0.15); // 0.65
+  TP.addTransform(std::make_unique<AOSTransform>(), 0.15); // 0.8
+  TP.addTransform(std::make_unique<SwapTransform>(), 0.05); // 0.85
+  TP.addTransform(std::make_unique<InterchangeTransform>(), 0.05); // 0.85
+
+  auto transform = [&](LayoutDataType *Layout) -> std::unique_ptr<LayoutDataType> {
+    auto Ret = LayoutDataType::copy(*Layout);
+    auto *S = cast<LayoutStruct>(Ret.get());
+    S->mergeFields(0, 0);
+    S->flatten(0);
+    S->reset();
+    return Ret;
+    //std::vector<std::shared_ptr<LayoutDataType>> Tmps;
+    //Tmps.push_back(TP.apply(*Layout));
+    //for (int i = 0; i < 7; i++)
+    //  Tmps.push_back(TP.apply(*Tmps.back()));
+    //return Tmps.back();
+  };
+
   unsigned NumUniqueNodes = 0;
   for (auto TargetAndGroup : Targets) {
     const DSNode *Target;
@@ -950,8 +975,7 @@ bool LayoutTuner::runOnModule(Module &M) {
         auto OrigLayout = std::shared_ptr<LayoutStruct>(
             LayoutStruct::create(Target, TD, SizeVar, IdxVar));
         Transforms[Group] = std::make_shared<LayoutLowering>(
-            //Target, interchange(*factorBy4(*OrigLayout)), SizeVar, IdxVar,
-            Target, swapFields(*OrigLayout), SizeVar, IdxVar,
+            Target, transform(OrigLayout.get()), SizeVar, IdxVar,
             TD);
         errs() << "ADDR OF TRANSFORM: " << Transforms[Group].get() << '\n';
         NumUniqueNodes++;
@@ -962,8 +986,7 @@ bool LayoutTuner::runOnModule(Module &M) {
       auto OrigLayout = std::shared_ptr<LayoutStruct>(
           LayoutStruct::create(Target, TD, SizeVar, IdxVar));
       Transforms[Group] = std::make_shared<LayoutLowering>(
-          //Target, interchange(*factorBy4(*OrigLayout)), SizeVar, IdxVar,
-          Target, swapFields(*OrigLayout), SizeVar, IdxVar,
+          Target, transform(OrigLayout.get()), SizeVar, IdxVar,
           TD);
       errs() << "ADDR OF TRANSFORM: " << Transforms[Group].get() << '\n';
       NumUniqueNodes++;
@@ -1514,6 +1537,11 @@ void LayoutTuner::applyTransformation(
 
   std::vector<std::pair<Function *, RefSetTracker<TargetMapTy>>> Worklist;
 
+  // TODO: this initialization is not correct
+  // consider this graph v { A } -> w { A', B }, with A and B being targets
+  // if we `w` first, only B will be recognized as targes.
+  // The right approach here is to start from root of the call graph
+  // and propagate target nodes properly
   for (auto *RootFn : RootFns)
     Worklist.push_back({RootFn, TransTargets});
 
@@ -1889,6 +1917,9 @@ void LayoutTuner::applyTransformation(
                  << '\n';
 
           auto *CallerG = getDSGraph(F), *CalleeG = getDSGraph(Callee);
+          // TODO: how we propagate targets from caller to callee is incorrect
+          // There are cases where a dsnode in callee is a target but is omitted
+          //
           // propagate targets from caller to callee
           // also propagate the group tag
           TargetMapTy TargetsInCallee;
@@ -2161,7 +2192,6 @@ void LayoutTuner::applyTransformation(
 
         if (auto *ICMP = dyn_cast<ICmpInst>(&*I)) {
           errs() << "--- handling icmp\n";
-          errs() << *ICMP << '\n';
           auto *Ty = ICMP->getOperand(0)->getType();
 
           for (unsigned i = 0, e = ICMP->getNumOperands(); i != e; i++) {
@@ -2190,7 +2220,6 @@ void LayoutTuner::applyTransformation(
       }
     }
 
-    errs() << "--- Fixing incomplete PHIs\n";
     for (const auto &Pair : IncomingValues) {
       auto &Triple = TripleMap.at(Pair.first);
       for (auto &IncomingTriple : Pair.second) {
@@ -2202,9 +2231,6 @@ void LayoutTuner::applyTransformation(
                                                  IncomingTriple.IncomingBB);
       }
     }
-    errs() << "========================================\n";
-    errs() << *F;
-    errs() << "========================================\n";
   }
 }
 
@@ -2323,6 +2349,7 @@ std::set<const DSNode *> LayoutTuner::findTransformableNodes(const Module &M) {
 }
 
 int main(int argc, char **argv) {
+  std::srand(42);
   // Print a stack trace if we signal out.
   sys::PrintStackTraceOnErrorSignal(argv[0]);
   PrettyStackTraceProgram X(argc, argv);

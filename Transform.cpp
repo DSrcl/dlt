@@ -1,67 +1,123 @@
+#include <llvm/Support/raw_ostream.h>
 #include "Transform.h"
 
 using namespace llvm;
 
-namespace {
-unsigned rand(unsigned Min, unsigned Max) {
+static unsigned rand(unsigned Min, unsigned Max) {
   return Min + std::rand() % (Max - Min);
 }
 
-std::pair<unsigned, unsigned> choose2(unsigned Num) {
+static double randProb() {
+  return std::rand() / double(RAND_MAX);
+}
+
+static std::pair<unsigned, unsigned> choose2(unsigned Num) {
   unsigned A = rand(0, Num), B;
   do B = rand(0, Num); while (A == B);
   return {A, B};
 }
+
+LayoutDataType *LayoutTransform::select(LayoutDataType *Layout, std::vector<LayoutDataType *> &Parents) const {
+  auto *Struct = dyn_cast<LayoutStruct>(Layout);
+
+  // got nothing to select from
+  if (!Struct) {
+    return Layout;
+  }
+
+
+  double p = randProb();
+  if (p < TransformParams::PRoot) {
+    return Layout;
+  }
+
+  auto Fields = Struct->getFields();
+  auto *SubLayout = Fields[rand(0, Fields.size())].second.get();
+  Parents.push_back(Layout);
+  return select(SubLayout, Parents);
 }
 
-// TODO: don't apply this on constant dimension
-std::shared_ptr<LayoutDataType>
-FactorTransform::apply(const LayoutDataType &Layout) const {
-  std::shared_ptr<LayoutDataType> NewLayout = LayoutDataType::copy(Layout);
-  // noop if there's nothing to factor
-  if (NewLayout->getDims().empty())
-    return NewLayout;
-
-  NewLayout->factorInnermost(Factor);
-  if (auto *Struct = dyn_cast<LayoutStruct>(NewLayout.get()))
-    Struct->reset();
+std::unique_ptr<LayoutDataType>
+LayoutTransform::apply(const LayoutDataType &Layout) const {
+  auto NewLayout = LayoutDataType::copy(Layout);
+  // randomly select a sub-layout and apply the transformation
+  std::vector<LayoutDataType *> Parents;
+  auto *SubLayout = select(NewLayout.get(), Parents);
+  transform(SubLayout);
+  for (auto It = Parents.rbegin(), E = Parents.rend(); It != E; ++It)
+    cast<LayoutStruct>(*It)->reset();
   return NewLayout;
 }
 
-std::shared_ptr<LayoutDataType>
-SOATransform::apply(const LayoutDataType &Layout) const {
-  // noop if the input is not a struct
-  if (!isa<LayoutStruct>(&Layout))
-    return LayoutDataType::copy(Layout);
+void TransformPool::addTransform(std::unique_ptr<LayoutTransform> Transform, float Prob) {
+  assert(Prob <= 1 && "Probability is greater than 1");
 
-  auto &Struct = *cast<LayoutStruct>(&Layout);
-  auto NewStruct = std::make_shared<LayoutStruct>(Struct);
+  if (Probs.empty()) {
+    Probs.push_back(Prob);
+    Transforms.push_back(std::move(Transform));
+    return;
+  }
 
-  auto Dims = Struct.getDims();
-  // noop if input layout is not an array
-  if (Dims.empty())
-    return LayoutDataType::copy(Layout);
+  float Acc = Probs.back() + Prob;
+  assert(Acc <= 1 && "Sum of inidividual probability greater than 1");
 
-  auto Dim = Dims[0];
-  NewStruct->removeInnermostDim();
-
-  for (auto &Field : NewStruct->getFields())
-    Field.second->appendDim(Dim);
-
-  NewStruct->reset();
-
-  return NewStruct;
+  Probs.push_back(Acc);
+  Transforms.push_back(std::move(Transform));
 }
 
-std::shared_ptr<LayoutDataType>
-AOSTransform::apply(const LayoutDataType &Layout) const {
-  if (!isa<LayoutStruct>(&Layout))
-    return LayoutDataType::copy(Layout);
+std::unique_ptr<LayoutDataType> TransformPool::apply(const LayoutDataType &Layout) const {
+  double p = randProb();
+  for (unsigned i = 0, e = Probs.size(); i != e; i++)
+    if (Probs[i] > p)
+      return Transforms[i]->apply(Layout);
 
-  auto &Struct = *cast<LayoutStruct>(&Layout);
-  auto NewStruct = std::make_shared<LayoutStruct>(Struct);
+  // apply none of the transformations
+  return LayoutDataType::copy(Layout);
+}
 
-  auto Fields = NewStruct->getFields();
+void FactorTransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** FACTOR\n";
+  if (Layout->getDims().empty())
+    return;
+
+  // don't factor constant dimension
+  if (isa<SymConst>(Layout->getDims()[0].first.get()))
+    return;
+
+  Layout->factorInnermost(Factor);
+  if (auto *Struct = dyn_cast<LayoutStruct>(Layout))
+    Struct->reset();
+}
+
+void SOATransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** SOA\n";
+  auto *Struct = dyn_cast<LayoutStruct>(Layout);
+
+  // noop if the input is not a struct
+  if (!Struct)
+    return;
+
+  auto Dims = Struct->getDims();
+  // noop if input layout is not an array
+  if (Dims.empty())
+    return;
+
+  auto Dim = Dims[0];
+  Struct->removeInnermostDim();
+  for (auto &Field : Struct->getFields())
+    Field.second->appendDim(Dim);
+
+  Struct->reset();
+}
+
+void AOSTransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** AOS\n";
+  auto *Struct = dyn_cast<LayoutStruct>(Layout);
+
+  if (!Struct)
+    return;
+
+  auto Fields = Struct->getFields();
 
   // check if there's a common factor among the outermost dimenion
   // of all the fields
@@ -70,93 +126,79 @@ AOSTransform::apply(const LayoutDataType &Layout) const {
   // the size expression have the same address
   //
   SymExpr *CommonDim = nullptr;
-  for (auto Field : Fields) {
+  for (auto &Field : Fields) {
+    if (Field.second->getDims().empty())
+      return;
     SymExpr *Dim = Field.second->getDims().rbegin()->first.get();
     if (!CommonDim)
       CommonDim = Dim;
     else if (CommonDim != Dim)
       // fields don't have common outer dimensions, give up
-      return NewStruct;
+      return;
   }
 
   auto Dim = *Fields[0].second->getDims().rbegin();
-  NewStruct->prependDim(Dim);
-  for (auto Field : Fields) {
+  Struct->prependDim(Dim);
+  for (auto &Field : Fields) {
     Field.second->removeOutermostDim();
     if (auto *S = dyn_cast<LayoutStruct>(Field.second.get()))
       S->reset();
   }
 
-  NewStruct->reset();
-
-  return NewStruct;
+  Struct->reset();
 }
 
-std::shared_ptr<LayoutDataType>
-StructTransform::apply(const LayoutDataType &Layout) const {
-  if (!isa<LayoutStruct>(&Layout))
-    return LayoutDataType::copy(Layout);
+void StructTransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** STRUCT\n";
+  auto *Struct = dyn_cast<LayoutStruct>(Layout);
 
-  auto &Struct = *cast<LayoutStruct>(&Layout);
-  auto NewStruct = std::make_shared<LayoutStruct>(Struct);
+  if (!Struct || Struct->getFields().size() <= 2)
+    return;
 
-  // merging two fields or less doesn't change any thing
-  if (Struct.getFields().size() <= 2)
-    return NewStruct;
-
-  auto Fields = NewStruct->getFields();
+  auto Fields = Struct->getFields();
   unsigned Begin = rand(0, Fields.size() - 1),
            End = rand(Begin + 1, Fields.size());
-  NewStruct->mergeFields(Begin, End);
-  NewStruct->reset();
-  return NewStruct;
+  Struct->mergeFields(Begin, End);
+  Struct->reset();
 }
 
-std::shared_ptr<LayoutDataType>
-StructFlattenTransform::apply(const LayoutDataType &Layout) const {
-  if (!isa<LayoutStruct>(&Layout))
-    return LayoutDataType::copy(Layout);
+void StructFlattenTransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** FLATTENING\n";
+  auto *Struct = dyn_cast<LayoutStruct>(Layout);
+  if (!Struct)
+    return;
 
-  auto &Struct = *cast<LayoutStruct>(&Layout);
-  auto NewStruct = std::make_shared<LayoutStruct>(Struct);
-
-  NewStruct->flatten(rand(0, NewStruct->getFields().size()));
-  NewStruct->reset();
-  return NewStruct;
+  unsigned NumFields = Struct->getFields().size();
+  Struct->flatten(rand(0, NumFields));
+  Struct->reset();
 }
 
-std::shared_ptr<LayoutDataType>
-InterchangeTransform::apply(const LayoutDataType &Layout) const {
-  auto NewLayout = LayoutDataType::copy(Layout);
-  auto Dims = NewLayout->getDims();
+void InterchangeTransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** INTERCHANGE\n";
+  auto Dims = Layout->getDims();
 
   // not enough dimensions to interchange
   if (Dims.size() < 2)
-    return NewLayout;
+    return;
 
   unsigned A, B;
   std::tie(A, B) = choose2(Dims.size());
-  NewLayout->swapDims(A, B);
-
-  return NewLayout;
+  Layout->swapDims(A, B);
 }
 
-std::shared_ptr<LayoutDataType>
-SwapTransform::apply(const LayoutDataType &Layout) const {
-  auto NewLayout = LayoutDataType::copy(Layout);
-  auto *Struct = dyn_cast<LayoutStruct>(NewLayout.get());
+void SwapTransform::transform(LayoutDataType *Layout) const {
+  errs() << "*** SWAP\n";
+  auto *Struct = dyn_cast<LayoutStruct>(Layout);
   if (!Struct)
-    return NewLayout;
+    return;
 
   auto Fields = Struct->getFields();
   if (Fields.size() < 2)
-    return NewLayout;
+    return;
 
   unsigned A, B;
   std::tie(A, B) = choose2(Fields.size());
 
   Struct->swapFields(A, B);
   Struct->reset();
-
-  return NewLayout;
 }

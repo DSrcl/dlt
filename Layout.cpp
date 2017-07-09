@@ -20,10 +20,22 @@ unsigned LayoutDataType::getAlignedSize(const DataLayout *TD) const {
   return TD->getABITypeAlignment(getLeftmostType());
 }
 
+LayoutStruct::LayoutStruct(const LayoutStruct &Src)
+  : LayoutDataType(DTK_Struct), TD(Src.TD) {
+  Fields.resize(Src.Fields.size());
+  for (unsigned i = 0, e = Fields.size(); i != e; i++) {
+    Fields[i].first = Src.Fields[i].first;
+    Fields[i].second = LayoutDataType::copy(*Src.Fields[i].second);
+  }
+  // TODO: reuse calculations from Src
+  reset();
+}
+
 void LayoutStruct::reset() {
-  auto FirstField = Fields.begin()->second;
+  const LayoutDataType *FirstField = Fields.begin()->second.get();
+  const LayoutDataType *PrevField = FirstField;
   ExprPtr Size = FirstField->getSizeForAll(TD);
-  const LayoutDataType *PrevField = FirstField.get();
+  OffsetOf.clear();
   OffsetOf[Fields.begin()->second.get()] = Const(0);
 
   LLVMType = nullptr;
@@ -66,8 +78,13 @@ void LayoutStruct::reset() {
   SizeForOne = Size;
 }
 
-LayoutStruct::LayoutStruct(std::vector<Field> TheFields, const DataLayout *TD_)
-    : LayoutDataType(DTK_Struct), TD(TD_), Fields(TheFields) {
+LayoutStruct::LayoutStruct(std::vector<Field> &TheFields, const DataLayout *TD_)
+    : LayoutDataType(DTK_Struct), TD(TD_) {
+  Fields.resize(TheFields.size());
+  for (unsigned i = 0, e = Fields.size(); i != e; i++) {
+    Fields[i].first = TheFields[i].first;
+    Fields[i].second = std::move(TheFields[i].second);
+  }
   reset();
 }
 
@@ -77,7 +94,7 @@ LayoutStruct *LayoutStruct::create(const DSNode *Src, const DataLayout *TD,
   unsigned i = 0;
   for (auto ti = Src->type_begin(), te = Src->type_end(); ti != te; ++ti, ++i) {
     Type *Ty = const_cast<Type *>(*ti->second->begin());
-    Fields.push_back({i, std::make_shared<LayoutScalar>(Ty)});
+    Fields.push_back({i, make_unique<LayoutScalar>(Ty)});
   }
   auto *Layout = new LayoutStruct(Fields, TD);
   // assume this object is an array
@@ -110,15 +127,12 @@ void LayoutDataType::factorInnermost(ExprPtr Factor) {
   prependDim({Factor, std::make_shared<SymMod>(I, Factor)});
 }
 
-std::shared_ptr<LayoutDataType>
+std::unique_ptr<LayoutDataType>
 LayoutDataType::copy(const LayoutDataType &Layout) {
-  std::shared_ptr<LayoutDataType> Copy;
   if (isa<LayoutScalar>(&Layout))
-    Copy = std::make_shared<LayoutScalar>(*cast<LayoutScalar>(&Layout));
-  else
-    Copy = std::make_shared<LayoutStruct>(*cast<LayoutStruct>(&Layout));
+    return make_unique<LayoutScalar>(*cast<LayoutScalar>(&Layout));
 
-  return Copy;
+  return make_unique<LayoutStruct>(*cast<LayoutStruct>(&Layout));
 }
 
 bool LayoutDataType::hasConstDims() const {
@@ -150,22 +164,31 @@ Type *LayoutDataType::getType() const {
 void LayoutStruct::mergeFields(unsigned Begin, unsigned End) {
   auto BeginIt = Begin > 0 ? std::next(Fields.begin(), Begin) : Fields.begin(),
        EndIt = std::next(Fields.begin(), End + 1);
-  std::vector<LayoutStruct::Field> FieldsToMerge(BeginIt, EndIt);
-  auto MergedField = std::make_shared<LayoutStruct>(FieldsToMerge, TD);
+  std::vector<LayoutStruct::Field> FieldsToMerge(
+      std::make_move_iterator(BeginIt),
+      std::make_move_iterator(EndIt));
+  auto MergedField = std::make_unique<LayoutStruct>(FieldsToMerge, TD);
   Fields.erase(std::next(BeginIt), EndIt);
-  *BeginIt = {-1, MergedField};
+  *BeginIt = {-1, std::move(MergedField)};
 }
 
 void LayoutStruct::flatten(unsigned i) {
   assert(i < Fields.size());
-  auto &FieldToRemove = Fields[i].second;
-  auto *Struct = dyn_cast<LayoutStruct>(FieldToRemove.get());
-  if (!Struct)
+  auto *FieldToRemove = Fields[i].second.get();
+  if (!FieldToRemove->getDims().empty())
     return;
 
-  auto FieldIt = i > 0 ? std::next(Fields.begin(), i) : Fields.begin(),
-       It = FieldIt;
-  for (auto &InnerField : Struct->getFields())
-    It = Fields.insert(std::next(It), InnerField);
-  Fields.erase(FieldIt);
+  auto *InnerStruct = dyn_cast<LayoutStruct>(FieldToRemove);
+  if (!InnerStruct)
+    return;
+
+  errs() << "FLATTENING STRUCT " << InnerStruct->Fields.size() << '\n';
+  std::vector<LayoutStruct::Field> InnerFields(
+      std::make_move_iterator(InnerStruct->Fields.begin()),
+      std::make_move_iterator(InnerStruct->Fields.end()));
+  auto FieldIt = i > 0 ? std::next(Fields.begin(), i) : Fields.begin();
+  FieldIt = Fields.erase(FieldIt);
+  Fields.insert(std::next(FieldIt),
+      std::make_move_iterator(InnerFields.begin()),
+      std::make_move_iterator(InnerFields.end()));
 }

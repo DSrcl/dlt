@@ -85,7 +85,7 @@ public:
   // factor the innermost dimension into two dimension
   void factorInnermost(ExprPtr Factor);
 
-  static std::shared_ptr<LayoutDataType> copy(const LayoutDataType &Layout);
+  static std::unique_ptr<LayoutDataType> copy(const LayoutDataType &Layout);
 
   //
   // Return the llvm type for this layout
@@ -134,10 +134,10 @@ class LayoutStruct : public LayoutDataType {
   //
   // Each field is tagged with the original idx before transformation.
   // Being tagged with -1 means the field is a result of transformation
-  // and doesn't have one-to-one correspondence to any original field
+  // and doesn't correspond to any original field
   //
 public:
-  typedef std::pair<int, std::shared_ptr<LayoutDataType>> Field;
+  typedef std::pair<int, std::unique_ptr<LayoutDataType>> Field;
 
 private:
   const llvm::DataLayout *TD;
@@ -146,7 +146,7 @@ private:
 
   ExprPtr SizeForOne;
 
-  // think offsetof macro
+  // mapping a field to its offset from beginning of the struct
   std::map<const LayoutDataType *, ExprPtr> OffsetOf;
 
   llvm::Type *LLVMType = nullptr;
@@ -168,7 +168,8 @@ public:
     return OffsetOf.at(Field);
   }
 
-  LayoutStruct(std::vector<Field> TheFields, const llvm::DataLayout *TD);
+  LayoutStruct(std::vector<Field> &TheFields, const llvm::DataLayout *TD);
+  LayoutStruct(const LayoutStruct &);
   static LayoutStruct *create(const llvm::DSNode *Src, const llvm::DataLayout *TD,
                               std::string SizeVar, std::string IdxVar);
 
