@@ -21,7 +21,7 @@ unsigned LayoutDataType::getAlignedSize(const DataLayout *TD) const {
 }
 
 LayoutStruct::LayoutStruct(const LayoutStruct &Src)
-  : LayoutDataType(DTK_Struct), TD(Src.TD) {
+  : LayoutDataType(Src), TD(Src.TD) {
   Fields.resize(Src.Fields.size());
   for (unsigned i = 0, e = Fields.size(); i != e; i++) {
     Fields[i].first = Src.Fields[i].first;
@@ -182,13 +182,8 @@ void LayoutStruct::flatten(unsigned i) {
   if (!InnerStruct)
     return;
 
-  errs() << "FLATTENING STRUCT " << InnerStruct->Fields.size() << '\n';
-  std::vector<LayoutStruct::Field> InnerFields(
+  Fields.insert(Fields.begin() + i + 1,
       std::make_move_iterator(InnerStruct->Fields.begin()),
       std::make_move_iterator(InnerStruct->Fields.end()));
-  auto FieldIt = i > 0 ? std::next(Fields.begin(), i) : Fields.begin();
-  FieldIt = Fields.erase(FieldIt);
-  Fields.insert(std::next(FieldIt),
-      std::make_move_iterator(InnerFields.begin()),
-      std::make_move_iterator(InnerFields.end()));
+  Fields.erase(Fields.begin() + i);
 }

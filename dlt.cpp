@@ -53,13 +53,6 @@
 // <<<< can probably put this off though, considering most program are not
 // pathological as this
 //
-// 3) `shouldCloneFunction` doesn't work when in cases like where a target ref is
-// allocated
-// in a malloc wrapper
-//
-// 4) rethink the algorithm for applyTransformation. The focus here should be
-// on tracking targets and nodes that refers to them. Maybe the legality can be
-// done in one pass
 //
 
 using namespace llvm;
@@ -279,6 +272,9 @@ class LayoutTuner : public ModulePass {
     }
   };
 
+  //
+  // Track which nodes refers to targets
+  //
   template <typename NODE_SET_TY> class RefSetTracker {
     NODE_SET_TY Targets;
     // mapping DSNode -> set of fields that are references to targets
@@ -290,6 +286,7 @@ class LayoutTuner : public ModulePass {
     RefSetTracker(const NODE_SET_TY &TheTargets) : Targets(TheTargets) {}
 
     const NODE_SET_TY &getTargets() const { return Targets; }
+    NODE_SET_TY &getTargets() { return Targets; }
 
     //
     // propagate reference info from caller to callee
@@ -409,7 +406,7 @@ class LayoutTuner : public ModulePass {
   void storeTriple(IndexTriple T, Value *Ptr, Instruction *InsertPt) const;
 
   void applyTransformation(
-      Module &M, std::vector<Function *> RootFns,
+      Module &M, 
       const TargetMapTy &TransTargets, const TargetMapTy &TargetsInGG,
       std::map<unsigned, OffsetMapTy> &OffsetMaps,
       std::map<unsigned, std::shared_ptr<TransformLowering>> &Transforms);
@@ -671,9 +668,6 @@ Value *LayoutLowering::ComputeAddress(IndexTriple Triple, unsigned Offset,
 
   auto *ETy = CurNode->getElementType();
   assert(ETy);
-  errs() << "GEP IDXS:\n";
-  for (auto *Idx  : GEPIdxs)
-    errs() << '\t' << *Idx << '\n';
   auto *Ptr = CastInst::CreatePointerCast(Addr, PointerType::getUnqual(ETy), "", InsertPt);
   return GetElementPtrInst::Create(ETy, Ptr, GEPIdxs, "", InsertPt);
 }
@@ -817,7 +811,6 @@ bool LayoutTuner::isAllocator(const Function *F) {
   // return std::any_of(
   //    AllocIdentifier->alloc_begin(), AllocIdentifier->alloc_end(),
   //    [&](const std::string Name) {
-  //    errs() << "XXXXX ALLOC XXX = " << Name << '\n';
   //    return F->getName() == Name; });
   StringRef Name = F->getName();
   return Name == "malloc" || Name == "calloc";
@@ -920,7 +913,6 @@ bool LayoutTuner::runOnModule(Module &M) {
   // mappping trasform group -> the group's layout
   std::map<unsigned, std::shared_ptr<TransformLowering>> Transforms;
 
-  std::vector<Function *> Fns;
   TargetMapTy TargetsInGG;
 
   TransformPool TP;
@@ -936,17 +928,11 @@ bool LayoutTuner::runOnModule(Module &M) {
   TP.addTransform(std::make_unique<InterchangeTransform>(), 0.05); // 0.85
 
   auto transform = [&](LayoutDataType *Layout) -> std::unique_ptr<LayoutDataType> {
-    auto Ret = LayoutDataType::copy(*Layout);
-    auto *S = cast<LayoutStruct>(Ret.get());
-    S->mergeFields(0, 0);
-    S->flatten(0);
-    S->reset();
-    return Ret;
-    //std::vector<std::shared_ptr<LayoutDataType>> Tmps;
-    //Tmps.push_back(TP.apply(*Layout));
-    //for (int i = 0; i < 7; i++)
-    //  Tmps.push_back(TP.apply(*Tmps.back()));
-    //return Tmps.back();
+    std::vector<std::unique_ptr<LayoutDataType>> Tmps;
+    Tmps.push_back(TP.apply(*Layout));
+    for (int i = 0; i < 7; i++)
+      Tmps.push_back(TP.apply(*Tmps.back()));
+    return std::move(Tmps.back());
   };
 
   unsigned NumUniqueNodes = 0;
@@ -968,6 +954,7 @@ bool LayoutTuner::runOnModule(Module &M) {
         // so, they *must* use the same transformation
         // TODO: merge transform group properly
         Transforms[Group] = Transforms.at(TargetsInGG.at(N));
+        errs() << "MERGED GROUP " << Group << '\n';
       } else {
         TargetsInGG[N] = Group;
         // Transforms[Group] = std::make_shared<NoopTransform>(Target);
@@ -991,19 +978,12 @@ bool LayoutTuner::runOnModule(Module &M) {
       errs() << "ADDR OF TRANSFORM: " << Transforms[Group].get() << '\n';
       NumUniqueNodes++;
     }
-
-    auto *G = Target->getParentGraph();
-    for (auto ri = G->retnodes_begin(), re = G->retnodes_end(); ri != re;
-         ++ri) {
-      Function *F = const_cast<Function *>(ri->first);
-      Fns.push_back(F);
-    }
   }
 
   errs() << "Number of unique nodes safe to transform: " << NumUniqueNodes
          << '\n';
 
-  applyTransformation(M, Fns, Targets, TargetsInGG, OffsetMaps, Transforms);
+  applyTransformation(M, Targets, TargetsInGG, OffsetMaps, Transforms);
 
   CalleeCallerMappings.clear();
   GToGGMappings.clear();
@@ -1293,6 +1273,7 @@ static bool isUnsupportedLibCall(const Function *F) {
 //
 // is the set of DSNodes `TransTargets` safe to transform?
 //
+// TODO: log why a node is not safe to transform
 bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
                                   OffsetMapTy &OffsetMap,
                                   std::map<DSGraph *, NodeSetTy> &TargetMap,
@@ -1333,8 +1314,10 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
       // For now, if there's ambiguity, just give up
       //
       for (auto *Target : CurTargets)
-        if (OffsetMap[Target].size() != 1)
+        if (OffsetMap[Target].size() != 1) {
+          errs() << "Can't transform target: multiple offsets\n";
           return false;
+        }
 
       //
       // we don't support indirect call that accesses target via
@@ -1350,8 +1333,10 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
             DenseSet<const DSNode *> ReachableNodes;
             N->markReachableNodes(ReachableNodes);
             for (auto *Target : CurTargets)
-              if (ReachableNodes.count(Target))
+              if (ReachableNodes.count(Target)) {
+                errs() << "Can't transform target: accessed via indirect call\n";
                 return false;
+              }
           }
       }
 
@@ -1361,8 +1346,10 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
       for (auto ni = G->node_begin(), ne = G->node_end(); ni != ne; ++ni) {
         const DSNode *N = &*ni;
         if (!TypeChecker.isTypeSafeIfInternal(N) &&
-            refersTargets(N, CurTargets))
+            refersTargets(N, CurTargets)) {
+          errs() << "Can't transform target: referred by unsafe node\n";
           return false;
+        }
       }
 
       //
@@ -1383,8 +1370,10 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
           assert(!OffsetMap.at(CallerN).empty());
           for (unsigned Offset : OffsetMap[CallerN]) {
             unsigned AbsOffset = Offset + RelOffset;
-            if (AbsOffset >= TargetSize)
+            if (AbsOffset >= TargetSize) {
+              errs() << "Can't transform target: bullshit\n";
               return false;
+            }
             Changed |= PotentialOffsets.insert(AbsOffset).second;
           }
 
@@ -1398,8 +1387,18 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
       const auto &NodeMap = getGToGGMapping(G);
       for (auto *Target : CurTargets) {
         auto Mapping = NodeMap.find(Target);
-        if (Mapping != NodeMap.end())
-          Changed |= TargetMap[GG].insert(Mapping->second.getNode()).second;
+        if (Mapping != NodeMap.end()) {
+          auto GGNH = Mapping->second;
+          Changed |= TargetMap[GG].insert(GGNH.getNode()).second;
+          assert(OffsetMap.count(Target));
+          assert(!OffsetMap.at(Target).empty());
+          OffsetMap[GGNH.getNode()].insert(
+              *OffsetMap.at(Target).begin() + GGNH.getOffset());
+          if (OffsetMap.at(GGNH.getNode()).size() != 1) {
+            errs() << "Can't transform target: multiple offsets\n";
+            return false;
+          }
+        }
       }
     }
   } while (Changed);
@@ -1419,7 +1418,11 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
               ->getElementType();
       if (TD->getTypeAllocSize(TyAfterConv) != SizeNeeded)
         return false;
-      errs() << "ahoy!\n";
+
+      // too much work to fix these
+      for (auto *U : G.users())
+        if (isa<ConstantExpr>(U))
+          return false;
     }
   }
 
@@ -1481,14 +1484,10 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
             continue;
 
           auto *Callee = CS.getCalledFunction();
-          if (Callee && isUnsupportedLibCall(Callee))
+          if (Callee && isUnsupportedLibCall(Callee)) {
+            errs() << "Can't transform target: called " << Callee->getName() << '\n';
             return false;
-          else if (!Callee)
-            for (auto ci = CG.callee_begin(CS), ce = CG.callee_end(CS);
-                 ci != ce; ++ci)
-              if (isUnsupportedLibCall(*ci))
-                return false;
-          errs() << "XXX" << Callee->getName() << "\n";
+          }
         }
   }
 
@@ -1506,12 +1505,15 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
 // one descend down
 // the call graph, DSNode::getSize is not accurate
 void LayoutTuner::applyTransformation(
-    Module &M, std::vector<Function *> RootFns, const TargetMapTy &TransTargets,
+    Module &M, const TargetMapTy &TransTargets,
     const TargetMapTy &TargetsInGG,
     std::map<unsigned, LayoutTuner::OffsetMapTy> &OffsetMaps,
     std::map<unsigned, std::shared_ptr<TransformLowering>> &Transforms) {
 
-  // re-declare globals that points to targets directly
+  // mapping global that points to targets -> same globals re-declared with proper types
+  std::map<Value *, Value *> RedeclaredGlobals;
+
+  // re-declare globals that points to targets with appropriate type
   auto *GG = DSA->getGlobalsGraph();
   auto gi = M.global_begin(), ge = M.global_end(), next_gi = std::next(gi);
   for (; gi != ge; gi = next_gi, ++next_gi) {
@@ -1522,28 +1524,27 @@ void LayoutTuner::applyTransformation(
       auto *NewType =
                getNewType(&G, NH, RefSetTracker<TargetMapTy>(TargetsInGG)),
            *NewValType = cast<PointerType>(NewType)->getElementType();
-      ;
       auto *NewInitializer =
           getNewInitializer(G.getInitializer(), N, NH.getOffset(), TargetsInGG);
       auto *NewG = new GlobalVariable(M, NewValType, G.isConstant(),
                                       G.getLinkage(), NewInitializer, "", &G);
-      NewG->takeName(&G);
-      G.mutateType(NewType);
-      G.replaceAllUsesWith(NewG);
+      RedeclaredGlobals[&G] = NewG;
       updateValue(&G, NewG);
-      removeValue(&G);
     }
   }
 
   std::vector<std::pair<Function *, RefSetTracker<TargetMapTy>>> Worklist;
 
-  // TODO: this initialization is not correct
-  // consider this graph v { A } -> w { A', B }, with A and B being targets
-  // if we `w` first, only B will be recognized as targes.
-  // The right approach here is to start from root of the call graph
-  // and propagate target nodes properly
-  for (auto *RootFn : RootFns)
-    Worklist.push_back({RootFn, TransTargets});
+  // scan the call graph top-down and rewrite functions along the way
+  for (auto gi = SortedSCCs.rbegin(), ge = SortedSCCs.rend();
+      gi != ge; ++gi) {
+    DSGraph *G = *gi;
+    for (auto ri = G->retnodes_begin(), re = G->retnodes_end();
+        ri != re; ++ri) {
+      auto *F = const_cast<Function *>(ri->first);
+      Worklist.push_back({ F, TransTargets });
+    }
+  }
 
   // Mapping <pointer to TransTarget> -> <triple converted pointer>
   std::map<Value *, IndexTriple> TripleMap;
@@ -1560,7 +1561,7 @@ void LayoutTuner::applyTransformation(
   while (!Worklist.empty()) {
     Function *F = Worklist.back().first;
     auto Refs = std::move(Worklist.back().second);
-    const auto &Targets = Refs.getTargets();
+    auto &Targets = Refs.getTargets();
     Worklist.pop_back();
 
     errs() << "!! processing " << F->getName() << '\n';
@@ -1572,6 +1573,25 @@ void LayoutTuner::applyTransformation(
     if (Processed[F])
       continue;
     Processed[F] = true;
+
+    // FIXME: why is this necesary
+    //
+    // propagate targets from global graph
+    auto &GToGGMapping = getGToGGMapping(getDSGraph(F));
+    for (auto &Mapping : GToGGMapping) {
+      auto It = TargetsInGG.find(Mapping.second.getNode());
+      if (It != TargetsInGG.end()) {
+        unsigned GroupId = It->second;
+        Targets[Mapping.first] = GroupId;
+        unsigned Offset = *OffsetMaps.at(GroupId).at(Mapping.second.getNode()).begin() +
+          Mapping.second.getOffset();
+        OffsetMaps[GroupId][Mapping.first].insert(Offset);
+      }
+    }
+
+    // F will be dead after cloning anyways
+    if (!CloneRecords.count(F) && shouldCloneFunction(F, Refs))
+      continue;
 
     //
     // Mapping a value to a set of <phi, basic block>, where it's used
@@ -1588,6 +1608,14 @@ void LayoutTuner::applyTransformation(
 
         assert(!isa<ExtractValueInst>(&*I) && !isa<InsertValueInst>(&*I) &&
                "doesn't support extractvalue or insertvalue yet");
+
+        for (unsigned i = 0, e = I->getNumOperands();
+            i != e; i++) {
+          auto &Op = I->getOperandUse(i);
+          auto Redeclared = RedeclaredGlobals.find(Op.get());
+          if (Redeclared != RedeclaredGlobals.end())
+            Op.set(Redeclared->second);
+        }
 
         auto *GEP = dyn_cast<GetElementPtrInst>(&*I);
         if (GEP && N) {
@@ -1702,7 +1730,6 @@ void LayoutTuner::applyTransformation(
             //
             // we replace original store of pointer to store of the triple
             Instruction *InsertPt = &*std::next(I);
-            // TODO: there's probably a better way to do this
             auto *TriplePtr =
                 CastInst::CreatePointerCast(Dest, TriplePtrTy, "", InsertPt);
             storeTriple(TripleMap.at(Src), TriplePtr, InsertPt);
@@ -1917,12 +1944,9 @@ void LayoutTuner::applyTransformation(
                  << '\n';
 
           auto *CallerG = getDSGraph(F), *CalleeG = getDSGraph(Callee);
-          // TODO: how we propagate targets from caller to callee is incorrect
-          // There are cases where a dsnode in callee is a target but is omitted
-          //
           // propagate targets from caller to callee
           // also propagate the group tag
-          TargetMapTy TargetsInCallee;
+          TargetMapTy TargetsInCallee = TransTargets;
           RefSetTracker<TargetMapTy> CalleeRefs;
           errs() << "Caller Graph: " << CallerG << ", Callee Graph" << CalleeG
                  << '\n';
@@ -1949,10 +1973,6 @@ void LayoutTuner::applyTransformation(
                 if (SameSCC) {
                   auto &Offsets = OffsetMaps.at(GroupId);
                   Offsets[CalleeN] = Offsets.at(CallerN);
-                } else {
-                  assert(OffsetMaps.count(GroupId));
-                  assert(OffsetMaps.at(GroupId).count(CalleeN) &&
-                         "Offset not found for callee target");
                 }
               }
             }
@@ -1960,7 +1980,7 @@ void LayoutTuner::applyTransformation(
                 Refs.getCalleeTracker(TargetsInCallee, CalleeCallerMapping);
           } else {
             // CalleeG == CallerG
-            // no need to propagate if stays in the same scc
+            // no need to propagate if stays in the same dsgraph
             TargetsInCallee = Targets;
             CalleeRefs = Refs;
           }
@@ -1972,6 +1992,9 @@ void LayoutTuner::applyTransformation(
                    << *CloneFnTy << '\n';
 
             Function *Clone;
+            //
+            // FIXME: the way we identify clones is broken
+            //
             // maybe we have a clone for this use already
             const auto CloneIt =
                 CloneCache.find({TargetsInCallee, getSrcFunc(Callee)});
@@ -2066,6 +2089,13 @@ void LayoutTuner::applyTransformation(
             }
             updateValue(&*I, NewCall);
           } else {
+            bool X = false;
+            for (auto &Arg : CS.args()) {
+              X |= Targets.count(getNodeForValue(Arg.get(), F).getNode());
+              if (getNodeForValue(Arg.get(), F).getNode())
+                X |= Refs.refersTargets(getNodeForValue(Arg.get(), F).getNode());
+            }
+            assert(!X);
             // the callee can still access target via global reference
             Worklist.push_back({Callee, TargetsInCallee});
           }
@@ -2335,12 +2365,6 @@ std::set<const DSNode *> LayoutTuner::findTransformableNodes(const Module &M) {
     for (auto N = Graph->node_begin(), NE = Graph->node_end(); N != NE; ++N)
       if (!N->isGlobalNode() && N->isHeapNode() && TypeChecker.isTypeSafe(&*N))
         Candidates.insert(&*N);
-
-    // filter out those pointed to by type-unsafe nodes
-    for (auto N = Graph->node_begin(), NE = Graph->node_end(); N != NE; ++N)
-      if (!TypeChecker.isTypeSafe(&*N))
-        for (auto LI = N->edge_begin(), LE = N->edge_end(); LI != LE; ++LI)
-          Candidates.erase(LI->second.getNode());
 
     SafeToTransform.insert(Candidates.begin(), Candidates.end());
   }
