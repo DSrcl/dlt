@@ -85,31 +85,31 @@ std::string getNewName() {
 // ===== functions for debugging =====
 //
 
-std::shared_ptr<LayoutDataType> toSOA(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> toSOA(const LayoutDataType &Layout) {
   return SOATransform().apply(Layout);
 }
 
-std::shared_ptr<LayoutDataType> toAOS(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> toAOS(const LayoutDataType &Layout) {
   return AOSTransform().apply(Layout);
 }
 
-std::shared_ptr<LayoutDataType> factorBy4(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> factorBy4(const LayoutDataType &Layout) {
   return FactorTransform(4).apply(Layout);
 }
 
-std::shared_ptr<LayoutDataType> struct_(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> struct_(const LayoutDataType &Layout) {
   return StructTransform().apply(Layout);
 }
 
-std::shared_ptr<LayoutDataType> structFlatten(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> structFlatten(const LayoutDataType &Layout) {
   return StructFlattenTransform().apply(Layout);
 }
 
-std::shared_ptr<LayoutDataType> interchange(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> interchange(const LayoutDataType &Layout) {
   return InterchangeTransform().apply(Layout);
 }
 
-std::shared_ptr<LayoutDataType> swapFields(const LayoutDataType &Layout) {
+std::unique_ptr<LayoutDataType> swapFields(const LayoutDataType &Layout) {
   return SwapTransform().apply(Layout);
 }
 
@@ -442,6 +442,10 @@ class LayoutTuner : public ModulePass {
   std::map<std::pair<const Instruction *, const Function *>, DSGraph::NodeMapTy>
       CalleeCallerMappings;
   const DSGraph::NodeMapTy &getCalleeCallerMapping(CallEdgeTy Edge);
+  
+  // same as DSGraph::getDSCallSiteForCallSite except
+  // it handles insert values
+  DSCallSite getDSCallSiteForCallSite(CallSite) const;
 
   std::map<DSGraph *, DSGraph::NodeMapTy> GToGGMappings;
   const DSGraph::NodeMapTy &getGToGGMapping(DSGraph *G);
@@ -514,6 +518,29 @@ public:
   virtual bool runOnModule(Module &) override;
   StringRef getPassName() const override { return "DataLayoutTuner pass"; }
 };
+
+// Determines if the DSGraph 'should' have a node for a given value.
+static bool shouldHaveNodeForValue(const Value *V) {
+  // Peer through casts
+  V = V->stripPointerCasts();
+  
+  // Only pointers get nodes
+  if (!isa<PointerType>(V->getType())) return false;
+
+  // Undef values, even ones of pointer type, don't get nodes.
+  if (isa<UndefValue>(V)) return false;
+
+  if (isa<ConstantPointerNull>(V))
+    return false;
+
+  // Use the Aliasee of GlobalAliases
+  // FIXME: This check might not be required, it's here because
+  // something similar is done in the Local pass.
+  if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(V))
+    return shouldHaveNodeForValue(GA->getAliasee());
+
+  return true;
+}
 
 } // end anonymous namespace
 
@@ -644,10 +671,11 @@ Value *LayoutLowering::ComputeAddress(IndexTriple Triple, unsigned Offset,
     auto Dims = Node->getDims();
 
     // find idx expression for array indexing
-    // Skip this for CurNode for which we emit a linearized index expression
-    if (Node != CurNode)
-      for (auto DI = Dims.rbegin(), DE = Dims.rend(); DI != DE; ++DI)
+    // Skip this for CurNode for which we've emitted a linearized index expression
+    if (Node != CurNode) {
+      for (auto DI = Dims.rbegin(), DE = Dims.rend(); DI != DE; ++DI) 
         GEPIdxs.push_back(DI->second->emitCode(Variables, InsertPt));
+    }
 
     // find idx for struct offset
     if (auto *Struct = dyn_cast<LayoutStruct>(Node)) {
@@ -668,8 +696,12 @@ Value *LayoutLowering::ComputeAddress(IndexTriple Triple, unsigned Offset,
 
   auto *ETy = CurNode->getElementType();
   assert(ETy);
+  errs() << "GEP IDXS:\n";
+  for (auto *Idx : GEPIdxs)
+    errs() << '\t'<< *Idx << '\n';
+  errs() << *ETy << '\n';
   auto *Ptr = CastInst::CreatePointerCast(Addr, PointerType::getUnqual(ETy), "", InsertPt);
-  return GetElementPtrInst::Create(ETy, Ptr, GEPIdxs, "", InsertPt);
+  return GetElementPtrInst::Create(ETy, Ptr, GEPIdxs, "newAddress", InsertPt);
 }
 
 Value *LayoutLowering::ComputeBytesToAlloc(Value *Size, Instruction *InsertPt) {
@@ -741,7 +773,8 @@ LayoutTuner::computeSizeWithTripleConv(DSNodeHandle NH,
 }
 
 //
-// clone a function and change it to use arguments properly in case one
+// clone a function and change it to use arguments properly
+//
 Function *LayoutTuner::cloneFunctionWithNewType(
     Function *Src, FunctionType *FnTy, const TargetMapTy &Targets,
     std::map<Value *, IndexTriple> &TripleMap) {
@@ -853,6 +886,8 @@ bool LayoutTuner::runOnModule(Module &M) {
 
   std::map<unsigned, OffsetMapTy> OffsetMaps;
   std::map<const DSNode *, std::map<DSGraph *, NodeSetTy>> TargetMaps;
+
+  errs() << "MIN SIZE IS " << MinSize << '\n';
 
   unsigned GroupIdx = 0;
   for (auto *Target : Candidates) {
@@ -1225,6 +1260,52 @@ const DSGraph::NodeMapTy &LayoutTuner::getGToGGMapping(DSGraph *G) {
   return Mapping;
 }
 
+DSCallSite LayoutTuner::getDSCallSiteForCallSite(CallSite CS) const {
+  DSNodeHandle RetVal, VarArg;
+  Instruction *I = CS.getInstruction();
+  Function *F = I->getParent()->getParent();
+  if (shouldHaveNodeForValue(I))
+    RetVal = getNodeForValue(I, F);
+
+  //FIXME: Here we trust the signature of the callsite to determine which arguments
+  //are var-arg and which are fixed.  Apparently we can't assume this, but I'm not sure
+  //of a better way.  For now, this assumption is known limitation.
+  const FunctionType *CalleeFuncType = DSCallSite::FunctionTypeOfCallSite(CS);
+  int NumFixedArgs = CalleeFuncType->getNumParams();
+  
+  // Sanity check--this really, really shouldn't happen
+  if (!CalleeFuncType->isVarArg())
+    assert(CS.arg_size() == static_cast<unsigned>(NumFixedArgs) &&
+        "Too many arguments/incorrect function signature!");
+
+  std::vector<DSNodeHandle> Args;
+  Args.reserve(CS.arg_end()-CS.arg_begin());
+
+  // Calculate the arguments vector...
+  for (CallSite::arg_iterator I = CS.arg_begin(), E = CS.arg_end(); I != E; ++I)
+    if (isa<PointerType>((*I)->getType())) {
+      DSNodeHandle ArgNode; // Initially empty
+      if (shouldHaveNodeForValue(*I)) ArgNode = getNodeForValue(I->get(), F);
+      if (I - CS.arg_begin() < NumFixedArgs) {
+        Args.push_back(ArgNode);
+      } else {
+        VarArg.mergeWith(ArgNode);
+      }
+    }
+
+  //
+  // Add a new function call entry.  We get the called value from the call site
+  // and strip pointer casts instead of asking the CallSite class to do that
+  // since CallSite::getCalledFunction() returns 0 if the called value is
+  // a bit-casted function constant.
+  //
+  if (Function *F=dyn_cast<Function>(CS.getCalledValue()->stripPointerCasts()))
+    return DSCallSite(CS, RetVal, VarArg, F, Args);
+  else
+    return DSCallSite(CS, RetVal, VarArg,
+                      getNodeForValue(CS.getCalledValue(), F).getNode(), Args);
+}
+
 //
 // Wrapper around DSGraph::computeCalleeCallerMapping to cache reuslt
 //
@@ -1252,8 +1333,8 @@ LayoutTuner::getCalleeCallerMapping(LayoutTuner::CallEdgeTy Edge) {
 
   auto *G = DSA->getDSGraph(*Caller);
   auto &CalleeCallerMapping = CalleeCallerMappings[CacheKey];
-  DSCallSite DSCS =
-      G->getDSCallSiteForCallSite(CallSite(const_cast<Instruction *>(I)));
+  // TODO: All the work before to get the original value of I is redundant
+  DSCallSite DSCS = getDSCallSiteForCallSite(CallSite(const_cast<Instruction *>(I)));
   DSGraph *CalleeG = DSA->getDSGraph(*Callee);
   G->computeCalleeCallerMapping(DSCS, *Callee, *CalleeG, CalleeCallerMapping,
                                 false);
@@ -1318,27 +1399,6 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
           errs() << "Can't transform target: multiple offsets\n";
           return false;
         }
-
-      //
-      // we don't support indirect call that accesses target via
-      // arguments, so be conservative here
-      //
-      for (auto &Edge : OutgoingEdges[G]) {
-        auto CS = Edge.first;
-        if (!CS.getCalledFunction())
-          for (auto &Arg : CS.args()) {
-            auto *N = G->getNodeForValue(Arg.get()).getNode();
-            if (!N)
-              continue;
-            DenseSet<const DSNode *> ReachableNodes;
-            N->markReachableNodes(ReachableNodes);
-            for (auto *Target : CurTargets)
-              if (ReachableNodes.count(Target)) {
-                errs() << "Can't transform target: accessed via indirect call\n";
-                return false;
-              }
-          }
-      }
 
       //
       // make sure no type-unsafe node is pointing to the target
@@ -1431,6 +1491,8 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
   // make sure that, if an element, B, if derived from another element, A, in an
   // array, it can *only* be derived with
   // `getelementptr <type with size of target>, A, ...` A's offset is 0.
+  //
+  // also make sure no indirect call could access a target
   for (auto &F : M) {
     if (F.empty())
       continue;
@@ -1460,13 +1522,34 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
             APInt RelOffset(TD->getPointerSizeInBits(GEP->getAddressSpace()),
                             0);
             bool HasConstOffset = GEP->accumulateConstantOffset(*TD, RelOffset);
-            assert(HasConstOffset);
+            if (!HasConstOffset)
+              return false;
             for (unsigned AbsOffset : AbsOffsets)
-              if ((AbsOffset + RelOffset).getSExtValue() >= TargetSize) {
+              if ((AbsOffset + RelOffset).getSExtValue() >= TargetSize)
                 return false;
-              }
           }
         } else if (auto CS = CallSite(const_cast<Instruction *>(&I))) {
+          //
+          // make sure no indirect call can access any target
+          //
+          if (!CS.getCalledFunction()) {
+            DenseSet<const DSNode *> ReachableNodes;
+            auto *RetN = G->getNodeForValue(CS.getInstruction()).getNode();
+            if (RetN)
+              RetN->markReachableNodes(ReachableNodes);
+
+            for (auto &Arg : CS.args()) {
+              auto *N = G->getNodeForValue(Arg.get()).getNode();
+              if (!N)
+                continue;
+              N->markReachableNodes(ReachableNodes);
+            }
+
+            for (auto *N : ReachableNodes)
+              if (Targets.count(N) || refersTargets(N, Targets))
+                return false;
+          }
+
           //
           // make sure we don't pass a target to memcpy, memmove, and memset
           //
@@ -1484,8 +1567,8 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
             continue;
 
           auto *Callee = CS.getCalledFunction();
-          if (Callee && isUnsupportedLibCall(Callee)) {
-            errs() << "Can't transform target: called " << Callee->getName() << '\n';
+          if (Callee &&
+              (Callee->isDeclarationForLinker() || isUnsupportedLibCall(Callee))) {
             return false;
           }
         }
@@ -1590,8 +1673,9 @@ void LayoutTuner::applyTransformation(
     }
 
     // F will be dead after cloning anyways
-    if (!CloneRecords.count(F) && shouldCloneFunction(F, Refs))
-      continue;
+    if (!CloneRecords.count(F) &&
+        shouldCloneFunction(F, Refs))
+        continue;
 
     //
     // Mapping a value to a set of <phi, basic block>, where it's used
@@ -1630,11 +1714,9 @@ void LayoutTuner::applyTransformation(
             errs() << "--- updating idx\n";
             // Src is Target
             // we postpone the actual address calculation by updating the triple
-            errs() << "--- looking up triple at " << Src << '\n';
+            assert(TripleMap.count(Src));
             IndexTriple &OldTriple = TripleMap.at(Src);
-            errs() << "--- setting triple for " << &*I << '\n';
             IndexTriple &NewTriple = TripleMap[GEP] = OldTriple;
-
             Instruction *InsertPt = &*std::next(I);
 
             // Update Idx
@@ -1693,8 +1775,6 @@ void LayoutTuner::applyTransformation(
             unsigned Offset =
                 *OffsetMaps.at(GroupId).at(PointerNH.getNode()).begin() +
                 PointerNH.getOffset();
-            errs() << "!!! OFFSET = " << Offset << '\n';
-
             errs() << "-- replacing load\n";
             assert(Transforms.count(GroupId) && "transform not found");
             assert(TripleMap.count(LI->getPointerOperand()) &&
@@ -1732,6 +1812,8 @@ void LayoutTuner::applyTransformation(
             Instruction *InsertPt = &*std::next(I);
             auto *TriplePtr =
                 CastInst::CreatePointerCast(Dest, TriplePtrTy, "", InsertPt);
+            errs() << *Src << '\n';
+            assert(TripleMap.count(Src));
             storeTriple(TripleMap.at(Src), TriplePtr, InsertPt);
             removeValue(SI);
           } else if (Targets.count(DestN)) {
@@ -2088,16 +2170,6 @@ void LayoutTuner::applyTransformation(
               removeValue(&*I);
             }
             updateValue(&*I, NewCall);
-          } else {
-            bool X = false;
-            for (auto &Arg : CS.args()) {
-              X |= Targets.count(getNodeForValue(Arg.get(), F).getNode());
-              if (getNodeForValue(Arg.get(), F).getNode())
-                X |= Refs.refersTargets(getNodeForValue(Arg.get(), F).getNode());
-            }
-            assert(!X);
-            // the callee can still access target via global reference
-            Worklist.push_back({Callee, TargetsInCallee});
           }
         } // end of handling function call
 
@@ -2149,6 +2221,9 @@ void LayoutTuner::applyTransformation(
           if (Targets.count(N)) {
             unsigned GroupId = Targets.at(N);
             // figure out total bytes allocated in the original allocation
+            //
+            // FIXME: this is not correct
+            // consider `alloca i32, 32` vs `alloca [32 x i32]`
             Type *SizeTy = AI->getArraySize()->getType();
             auto *OrigElemSize = ConstantInt::get(
                 SizeTy, TD->getTypeAllocSize(AI->getAllocatedType()));
@@ -2177,11 +2252,19 @@ void LayoutTuner::applyTransformation(
 
           unsigned SizeNeeded = computeSizeWithTripleConv(NH, Targets);
 
-          auto *TyAfterConv =
-              cast<PointerType>(getNewType(AI, NH, Refs))->getElementType();
+          //auto *TyAfterConv =
+          //    cast<PointerType>(getNewType(AI, NH, Refs))->getElementType();
+          auto *TyAfterConv = getNewType(NH.getNode(), Refs, AI->getAllocatedType(), NH.getOffset());
           // sometimes the alloca is not typed, so we need to check both the
           // type and size
           if (SizeNeeded > N->getSize() || TyAfterConv != AI->getType()) {
+            AllocaInst *NewAlloca;
+            Type *AllocatedType = AI->getAllocatedType(),
+                 *NewAllocatedType = TyAfterConv;
+            if (auto *AT = dyn_cast<ArrayType>(AllocatedType)) {
+              AllocatedType = AT->getElementType();
+              NewAllocatedType = cast<ArrayType>(TyAfterConv)->getElementType();
+            }
             //
             // There are two cases here.
             // case 1: The allocation is typed. e.g. `i32* array = alloca i32,
@@ -2189,9 +2272,8 @@ void LayoutTuner::applyTransformation(
             // case 2: The allocation is untyped, like malloc. e.g. `i32* array
             // = alloca i8, i64 size_in_bytes`.
             //
-            AllocaInst *NewAlloca;
-            if (TD->getTypeAllocSize(AI->getAllocatedType()) == N->getSize() &&
-                TD->getTypeAllocSize(TyAfterConv) == SizeNeeded) {
+            if (TD->getTypeAllocSize(AllocatedType) == N->getSize() &&
+                TD->getTypeAllocSize(NewAllocatedType) == SizeNeeded) {
               // case 1
               // this is the easy one, we just change the type being allocated
               NewAlloca =
@@ -2363,7 +2445,7 @@ std::set<const DSNode *> LayoutTuner::findTransformableNodes(const Module &M) {
 
     std::set<const DSNode *> Candidates;
     for (auto N = Graph->node_begin(), NE = Graph->node_end(); N != NE; ++N)
-      if (!N->isGlobalNode() && N->isHeapNode() && TypeChecker.isTypeSafe(&*N))
+      if (!N->isGlobalNode() && TypeChecker.isTypeSafe(&*N))
         Candidates.insert(&*N);
 
     SafeToTransform.insert(Candidates.begin(), Candidates.end());

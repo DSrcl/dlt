@@ -155,7 +155,7 @@ Type *LayoutDataType::getType() const {
       CurTy = ArrayType::get(CurTy, Size->Val);
     } else
       // give up if one of the dimenion is not const
-      return ETy;
+      return nullptr;
   }
 
   return CurTy;
