@@ -53,6 +53,8 @@
 // <<<< can probably put this off though, considering most program are not
 // pathological as this
 //
+// 3) think of a way to do legality check in a single pass
+//
 //
 
 using namespace llvm;
@@ -893,6 +895,7 @@ bool LayoutTuner::runOnModule(Module &M) {
   for (auto *Target : Candidates) {
     auto &OffsetMap = OffsetMaps[GroupIdx];
     auto &TargetMap = TargetMaps[Target];
+    errs() << "=============\n";
     if (Target->getSize() > MinSize &&
         safeToTransform({Target}, OffsetMap, TargetMap, M)) {
       Targets[Target] = GroupIdx;
@@ -917,14 +920,20 @@ bool LayoutTuner::runOnModule(Module &M) {
 
     auto &TargetMap = TargetMaps[Target];
     unsigned GraphIdx = SCCToOrderMap[Target->getParentGraph()];
+    assert(SortedSCCs[GraphIdx] == Target->getParentGraph());
     for (unsigned i = GraphIdx + 1, e = SortedSCCs.size(); i != e; i++) {
       auto *G = SortedSCCs[i];
+      for (auto *N : TargetMap[G]) {
+        if (Targets.count(N))
+          errs() << "DAFUQ " << Targets.at(N) << " is covered by " << Targets.at(Target) << '\n';
+      }
       Targets2Remove.insert(TargetMap[G].begin(), TargetMap[G].end());
     }
   }
 
-  for (auto *Node : Targets2Remove)
+  for (auto *Node : Targets2Remove) {
     Targets.erase(Node);
+  }
 
   //
   // the transformation doesn't work (yet?) when one target refers another or
@@ -937,11 +946,17 @@ bool LayoutTuner::runOnModule(Module &M) {
     Changed = false;
     for (auto TargetAndGroup : Targets) {
       auto *Target = TargetAndGroup.first;
-      if (refersTargets(Target, Targets)) {
-        Changed = true;
-        Targets.erase(Target);
-        break;
+      auto *G = Target->getParentGraph();
+      for (auto TargetAndGroup2 : Targets) {
+        auto *Target2 = TargetAndGroup2.first;
+        if (refersTargets(Target, TargetMaps[Target2][G])) {
+          Changed = true;
+          Targets.erase(Target);
+          break;
+        }
       }
+      if (Changed)
+        break;
     }
   } while (Changed);
 
@@ -1299,8 +1314,8 @@ DSCallSite LayoutTuner::getDSCallSiteForCallSite(CallSite CS) const {
   // since CallSite::getCalledFunction() returns 0 if the called value is
   // a bit-casted function constant.
   //
-  if (Function *F=dyn_cast<Function>(CS.getCalledValue()->stripPointerCasts()))
-    return DSCallSite(CS, RetVal, VarArg, F, Args);
+  if (Function *Callee=dyn_cast<Function>(CS.getCalledValue()->stripPointerCasts()))
+    return DSCallSite(CS, RetVal, VarArg, Callee, Args);
   else
     return DSCallSite(CS, RetVal, VarArg,
                       getNodeForValue(CS.getCalledValue(), F).getNode(), Args);
@@ -1336,6 +1351,8 @@ LayoutTuner::getCalleeCallerMapping(LayoutTuner::CallEdgeTy Edge) {
   // TODO: All the work before to get the original value of I is redundant
   DSCallSite DSCS = getDSCallSiteForCallSite(CallSite(const_cast<Instruction *>(I)));
   DSGraph *CalleeG = DSA->getDSGraph(*Callee);
+
+  errs() << "COMPUTING CALLEE CALLER MAPPING\n";
   G->computeCalleeCallerMapping(DSCS, *Callee, *CalleeG, CalleeCallerMapping,
                                 false);
 
@@ -1354,7 +1371,8 @@ static bool isUnsupportedLibCall(const Function *F) {
 //
 // is the set of DSNodes `TransTargets` safe to transform?
 //
-// TODO: log why a node is not safe to transform
+// FIXME:
+// this is broken. We also need to check a
 bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
                                   OffsetMapTy &OffsetMap,
                                   std::map<DSGraph *, NodeSetTy> &TargetMap,
@@ -1418,11 +1436,14 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
       for (auto Edge : OutgoingEdges[G]) {
         const auto &CalleeCallerMapping = getCalleeCallerMapping(Edge);
         auto *CalleeG = DSA->getDSGraph(*Edge.second);
+        errs() << "PROCESSING EDGE " << Edge.first->getParent()->getParent()->getName() << " -> " << Edge.second->getName() << '\n';
         for (auto Mapping : CalleeCallerMapping) {
           auto *CalleeN = Mapping.first;
           auto *CallerN = Mapping.second.getNode();
           if (!CurTargets.count(CallerN))
             continue;
+
+          errs() << "PROP " << CallerN << " -> " << CalleeN << '\n';
 
           unsigned RelOffset = Mapping.second.getOffset();
           auto &PotentialOffsets = OffsetMap[CalleeN];
@@ -1430,10 +1451,8 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
           assert(!OffsetMap.at(CallerN).empty());
           for (unsigned Offset : OffsetMap[CallerN]) {
             unsigned AbsOffset = Offset + RelOffset;
-            if (AbsOffset >= TargetSize) {
-              errs() << "Can't transform target: bullshit\n";
+            if (AbsOffset >= TargetSize)
               return false;
-            }
             Changed |= PotentialOffsets.insert(AbsOffset).second;
           }
 
@@ -1479,12 +1498,13 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
       if (TD->getTypeAllocSize(TyAfterConv) != SizeNeeded)
         return false;
 
-      // too much work to fix these
+      // for now only allow such globals to be used in instructions directly
       for (auto *U : G.users())
-        if (isa<ConstantExpr>(U))
+        if (isa<Constant>(U))
           return false;
     }
   }
+  errs() << "I am here\n";
 
   auto &CG = DSA->getCallGraph();
 
@@ -1567,8 +1587,9 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
             continue;
 
           auto *Callee = CS.getCalledFunction();
+          bool HasDefinition = isDeallocator(Callee) || isAllocator(Callee) || !Callee->isDeclarationForLinker();
           if (Callee &&
-              (Callee->isDeclarationForLinker() || isUnsupportedLibCall(Callee))) {
+              (!HasDefinition || isUnsupportedLibCall(Callee))) {
             return false;
           }
         }
@@ -1583,6 +1604,9 @@ bool LayoutTuner::safeToTransform(const NodeSetTy &TransTargets,
 // TODO: handle cases where one targets points to another...
 // delay code-gen for address calculation)
 // TODO: handle indirect call
+//
+// TODO: try *really hard* to think about why the way we processing function works (I think?)
+// -- push orig functions on to worklist first, and don't process functions that should be clone
 //
 // FIXME: Should record size of target/target-ref on top level, since once once
 // one descend down
@@ -1760,7 +1784,7 @@ void LayoutTuner::applyTransformation(
 
           auto PointerNH = getNodeForValue(LI->getPointerOperand(), F);
           if (Targets.count(PointerNH.getNode())) {
-            errs() << "--- loading *from* triple-converted pointer\n";
+            errs() << "--- loading from triple-converted pointer\n";
             // case 2: loading from Target itself
             // we need to replace the load, since layout of the allocation has
             // changed
@@ -2047,14 +2071,17 @@ void LayoutTuner::applyTransformation(
 
               auto It = Targets.find(CallerN);
               if (It != Targets.end()) {
-                assert(!TargetsInCallee.count(CalleeN) &&
-                       "callee to caller can't has one-to-many mapping");
+                errs() << "TARGET MAPPING " << CallerN << " -> " << CalleeN << '\n';
                 unsigned GroupId = It->second;
                 TargetsInCallee[CalleeN] = GroupId;
 
                 if (SameSCC) {
                   auto &Offsets = OffsetMaps.at(GroupId);
                   Offsets[CalleeN] = Offsets.at(CallerN);
+                } else {
+                  assert(OffsetMaps.count(GroupId));
+                  assert(OffsetMaps.at(GroupId).count(CalleeN) &&
+                      "Offset not found for callee target");
                 }
               }
             }
@@ -2075,7 +2102,7 @@ void LayoutTuner::applyTransformation(
 
             Function *Clone;
             //
-            // FIXME: the way we identify clones is broken
+            // FIXME: the way we identify reusable clones is broken
             //
             // maybe we have a clone for this use already
             const auto CloneIt =
@@ -2252,9 +2279,9 @@ void LayoutTuner::applyTransformation(
 
           unsigned SizeNeeded = computeSizeWithTripleConv(NH, Targets);
 
-          //auto *TyAfterConv =
-          //    cast<PointerType>(getNewType(AI, NH, Refs))->getElementType();
-          auto *TyAfterConv = getNewType(NH.getNode(), Refs, AI->getAllocatedType(), NH.getOffset());
+          auto *TyAfterConv =
+              cast<PointerType>(getNewType(AI, NH, Refs))->getElementType();
+          //auto *TyAfterConv = getNewType(NH.getNode(), Refs, AI->getAllocatedType(), NH.getOffset());
           // sometimes the alloca is not typed, so we need to check both the
           // type and size
           if (SizeNeeded > N->getSize() || TyAfterConv != AI->getType()) {
@@ -2279,6 +2306,7 @@ void LayoutTuner::applyTransformation(
               NewAlloca =
                   new AllocaInst(TyAfterConv, AI->getArraySize(), "", AI);
             } else {
+              errs() << *AI << ", " << *AllocatedType << ", " << *NewAllocatedType << '\n';
               // case 2
               // need to calculate number of bytes needed
               assert(AI->getAllocatedType() == Int8Ty &&
@@ -2425,6 +2453,8 @@ bool LayoutTuner::shouldCloneFunction(
   return false;
 }
 
+// TODO:
+// rewrite this to incorporate ::safeToTransform to do legality-check/preprocessing in a single pass
 std::set<const DSNode *> LayoutTuner::findTransformableNodes(const Module &M) {
   std::set<const DSNode *> SafeToTransform;
 
@@ -2445,7 +2475,7 @@ std::set<const DSNode *> LayoutTuner::findTransformableNodes(const Module &M) {
 
     std::set<const DSNode *> Candidates;
     for (auto N = Graph->node_begin(), NE = Graph->node_end(); N != NE; ++N)
-      if (!N->isGlobalNode() && TypeChecker.isTypeSafe(&*N))
+      if (!N->isGlobalNode() && N->isHeapNode() && TypeChecker.isTypeSafe(&*N))
         Candidates.insert(&*N);
 
     SafeToTransform.insert(Candidates.begin(), Candidates.end());
