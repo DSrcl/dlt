@@ -4,9 +4,7 @@
 #include "dsa/TypeSafety.h"
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/Twine.h>
-#include <llvm/Analysis/AliasSetTracker.h>
 #include <llvm/Analysis/LoopInfo.h>
-#include <llvm/Analysis/MemoryDependenceAnalysis.h>
 #include <llvm/Bitcode/BitcodeWriterPass.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
