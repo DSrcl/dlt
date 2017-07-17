@@ -2,37 +2,38 @@
 #include "dsa/DataStructure.h"
 #include "dsa/InitializeDSAPasses.h"
 #include "dsa/TypeSafety.h"
-#include <llvm/ADT/SmallVector.h>
-#include <llvm/ADT/Twine.h>
-#include <llvm/Analysis/LoopInfo.h>
-#include <llvm/Bitcode/BitcodeWriterPass.h>
-#include <llvm/IR/BasicBlock.h>
-#include <llvm/IR/Constants.h>
-#include <llvm/IR/DerivedTypes.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/GetElementPtrTypeIterator.h>
-#include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/Instructions.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/LegacyPassManager.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/Type.h>
-#include <llvm/IR/Verifier.h>
-#include <llvm/IRReader/IRReader.h>
-#include <llvm/Pass.h>
-#include <llvm/Support/CommandLine.h>
-#include <llvm/Support/FileSystem.h>
-#include <llvm/Support/ManagedStatic.h>
-#include <llvm/Support/PrettyStackTrace.h>
-#include <llvm/Support/Signals.h>
-#include <llvm/Support/SourceMgr.h>
-#include <llvm/Support/SystemUtils.h>
-#include <llvm/Support/ToolOutputFile.h>
-#include <llvm/Support/raw_ostream.h>
-#include <llvm/Transforms/Scalar.h>
-#include <llvm/Transforms/Utils/Cloning.h>
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Bitcode/BitcodeWriterPass.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ManagedStatic.h"
+#include "llvm/Support/PrettyStackTrace.h"
+#include "llvm/Support/Signals.h"
+#include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/SystemUtils.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include "Transform.h"
+#include "Evaluate.h"
 
 //
 // ========== RAAAAAAAAAAAAAAAAAAAAAAAAAMBLING ==========
@@ -69,6 +70,8 @@ cl::opt<std::string> OutputFilename("o", cl::desc("Specify output file name"),
 cl::opt<unsigned>
     MinSize("min-size", cl::desc("Minimum size of an object to be transformed"),
             cl::init(4));
+
+cl::list<std::string> TestArgv(cl::ConsumeAfter, cl::desc("<program arguments to test compiled module>"));
 
 struct IndexTriple {
   Value *Base, *Idx, *Size;
@@ -1272,14 +1275,9 @@ static bool isUnsupportedLibCall(const Function *F) {
          IID == Intrinsic::memset || F->getName() == "realloc";
 }
 
-//
-// TODO: finish this and get a drink
+// FIXME: get RefSetTracker to track size of objects that refers to any targets,
+//        and use that size when allocate these objects
 // TODO: handle memcpy, memmove, and memset
-// TODO: deal with recursive data structure
-// TODO: handle cases where one targets points to another...
-// delay code-gen for address calculation)
-// TODO: handle indirect call
-//
 // TODO: try *really hard* to think about why the way we processing function works (I think?)
 // -- push orig functions on to worklist first, and don't process functions that should be clone
 //
@@ -2453,6 +2451,7 @@ int main(int argc, char **argv) {
     errs() << EC.message() << '\n';
     return 1;
   }
+
 
   legacy::PassManager Passes;
   Passes.add(new LayoutTuner());

@@ -18,7 +18,7 @@ add_definitions(${LLVM_DEFINITIONS})
 add_definitions(-fno-rtti)
 
 # Now build our tools
-add_executable(dlt dlt.cpp Transform.cpp Layout.cpp)
+add_executable(dlt dlt.cpp Transform.cpp Layout.cpp Evaluate.cpp)
 
 # Find the libraries that correspond to the LLVM components
 # that we wish to use
