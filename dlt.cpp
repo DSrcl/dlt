@@ -39,6 +39,7 @@
 // 1) Maybe we should treat nodes that refers to target as the same way we treat targets?
 // perhaps with something TargetRefs? The primary rationale here is so that we
 // can track the actual size of these nodes acurately
+// <<< should be able to do this "easily" by changing RefSetTracker
 //
 // 2) When getting new type for GEP, relying on the input type is wrong.
 // e.g. when `{ char[offset_of_3rd_elem], int }, something, 0, 1 }` is used
@@ -50,8 +51,6 @@
 // `gep {char[offset_of_3rd_elem_after_conv], something, 0, 1}`
 // <<<< can probably put this off though, considering most program are not
 // pathological as this
-//
-// 3) think of a way to do legality check in a single pass
 //
 //
 
@@ -76,6 +75,7 @@ struct IndexTriple {
 };
 
 typedef std::vector<Value *> GEPIdxTy;
+typedef std::map<unsigned, Type *> FieldsTy;
 
 std::string getNewName() {
   static unsigned Counter = 0;
@@ -334,13 +334,13 @@ class LayoutTuner : public ModulePass {
     }
 
     bool refersTargets(const DSNode *N) const {
+      auto RefIt = RefRecords.find(N);
+      if (RefIt != RefRecords.end() && RefIt->second.hasReferences()) 
+        return true;
+
       for (auto ei = N->edge_begin(), ee = N->edge_end(); ei != ee; ++ei)
         if (Targets.count(ei->second.getNode()))
           return true;
-
-      auto RefIt = RefRecords.find(N);
-      if (RefIt != RefRecords.end())
-        return RefIt->second.hasReferences();
 
       return false;
     }
@@ -544,6 +544,14 @@ void insertInto(SET_TY &Dest, const SET_TY &Src) {
   Dest.insert(Src.begin(), Src.end());
 }
 
+void mergeWithNode(FieldsTy &Fields, const DSNode *N, unsigned Offset) {
+  for (auto ti = N->type_begin(), te = N->type_end();
+      ti != te; ++ti) {
+    auto *Ty = *ti->second->begin();
+    Fields[Offset + ti->first] = Ty;
+  }
+}
+
 } // end anonymous namespace
 
 char LayoutTuner::ID = 42;
@@ -555,14 +563,18 @@ INITIALIZE_PASS_DEPENDENCY(EquivBUDataStructures)
 INITIALIZE_PASS_DEPENDENCY(AllocIdentify)
 INITIALIZE_PASS_END(LayoutTuner, "", "", true, true)
 
+// FIXME this doens't work for fields with union type
+// need to get the largest type in this case
 TransformLowering::TransformLowering(const DSNode *Target) {
   std::vector<Type *> Fields;
   unsigned i = 0;
+  errs() << "TARGET FIELDS:\n";
   for (auto ti = Target->type_begin(), te = Target->type_end(); ti != te;
        ++ti, ++i) {
     Type *FieldTy = *ti->second->begin();
     Fields.push_back(FieldTy);
     Offset2IdxMap[ti->first] = i;
+    errs() << "\t(" << ti->first << "): " << *FieldTy << '\n';
   }
   LLVMContext &Ctx = Fields[0]->getContext();
   TargetTy = StructType::get(Ctx, Fields);
@@ -698,10 +710,6 @@ Value *LayoutLowering::ComputeAddress(IndexTriple Triple, unsigned Offset,
 
   auto *ETy = CurNode->getElementType();
   assert(ETy);
-  errs() << "GEP IDXS:\n";
-  for (auto *Idx : GEPIdxs)
-    errs() << '\t'<< *Idx << '\n';
-  errs() << *ETy << '\n';
   auto *Ptr = CastInst::CreatePointerCast(Addr, PointerType::getUnqual(ETy), "", InsertPt);
   return GetElementPtrInst::Create(ETy, Ptr, GEPIdxs, "newAddress", InsertPt);
 }
@@ -923,6 +931,7 @@ bool LayoutTuner::runOnModule(Module &M) {
     auto SizeVar = getNewName(), IdxVar = getNewName();
     auto OrigLayout = std::shared_ptr<LayoutStruct>(
         LayoutStruct::create(Target, TD, SizeVar, IdxVar));
+    errs() << "CREATING LAYOUT FOR GROUP " << Group << '\n';
     Transforms[Group] = std::make_shared<LayoutLowering>(
         Target, transform(OrigLayout.get()), SizeVar, IdxVar,
         TD);
@@ -934,7 +943,6 @@ bool LayoutTuner::runOnModule(Module &M) {
   GToGGMappings.clear();
 
   cleanupDeadValues();
-  M.dump();
 
   return true;
 }
@@ -1035,9 +1043,11 @@ Type *LayoutTuner::getNewType(const DSNode *N,
       if (Refs.hasRefAt(N, ElementOffset))
         NewET = TripleTy;
       else if (isa<PointerType>(ET) && N->hasLink(ElementOffset)) {
-        // pointer!
-        auto &Cell = N->getLink(ElementOffset);
-        NewET = getNewType(Cell.getNode(), Refs, ET, Cell.getOffset());
+        auto &Edge = N->getLink(ElementOffset);
+        if (Refs.getTargets().count(Edge.getNode()))
+          NewET = getNewType(Edge.getNode(), Refs, ET, Edge.getOffset());
+        else
+          NewET = ET;
       } else
         NewET = getNewType(N, Refs, ET, Offset);
 
@@ -1274,8 +1284,9 @@ static bool isUnsupportedLibCall(const Function *F) {
 // -- push orig functions on to worklist first, and don't process functions that should be clone
 //
 // FIXME: Should record size of target/target-ref on top level, since once once
-// one descend down
-// the call graph, DSNode::getSize is not accurate
+// one descend down the call graph, DSNode::getSize is not accurate. E.g
+// size of a node is likely to be zero in a malloc wrapper
+//
 void LayoutTuner::applyTransformation(
     Module &M, const TargetMapTy &TransTargets,
     const TargetMapTy &TargetsInGG,
@@ -1311,9 +1322,11 @@ void LayoutTuner::applyTransformation(
   };
   std::vector<RewriterContext> Worklist;
 
-  RewriterContext DefaultContext;
+  OffsetMapTy DefaultOffsets;
   for (auto Pair : TransTargets)
-    DefaultContext.Offsets[Pair.first] = 0;
+    DefaultOffsets[Pair.first] = 0;
+  RewriterContext DefaultContext;
+  DefaultContext.Offsets = DefaultOffsets;
   DefaultContext.Refs = TransTargets;
 
   // scan the call graph top-down and rewrite functions along the way
@@ -1362,7 +1375,8 @@ void LayoutTuner::applyTransformation(
     auto &GToGGMapping = getGToGGMapping(getDSGraph(F));
     for (auto &Mapping : GToGGMapping) {
       auto It = TargetsInGG.find(Mapping.second.getNode());
-      if (It != TargetsInGG.end()) {
+      if (It != TargetsInGG.end() &&
+          !Targets.count(Mapping.first)) {
         Offsets[Mapping.first] = 0;
         Targets[Mapping.first] = It->second;
       }
@@ -1420,6 +1434,18 @@ void LayoutTuner::applyTransformation(
               auto *Diff = GEP->idx_begin()->get();
               if (Diff->getType() != Int64Ty)
                 Diff = new ZExtInst(Diff, Int64Ty, "", InsertPt);
+              NewTriple.Idx = BinaryOperator::CreateNSWAdd(
+                  OldTriple.Idx, Diff, "updated_idx", InsertPt);
+            } else {
+              auto SrcNH = getNodeForValue(Src, F);
+              APInt RelOffset(TD->getPointerSizeInBits(GEP->getAddressSpace()), 0);
+              bool HasConstOffset = GEP->accumulateConstantOffset(*TD, RelOffset);
+              assert(HasConstOffset);
+              unsigned GroupId = Targets.at(N);
+              Constant *TargetSize = Transforms.at(GroupId)->getOrigSize(),
+                       *AbsOffset = ConstantInt::get(TargetSize->getType(),
+                           RelOffset + Offsets.at(SrcNH.getNode()) + SrcNH.getOffset());
+              auto *Diff = BinaryOperator::CreateURem(AbsOffset, TargetSize, "", InsertPt);
               NewTriple.Idx = BinaryOperator::CreateNSWAdd(
                   OldTriple.Idx, Diff, "updated_idx", InsertPt);
             }
@@ -1522,10 +1548,11 @@ void LayoutTuner::applyTransformation(
             // which knows the precise layout
             Instruction *InsertPt = &*std::next(I);
             unsigned GroupId = Targets.at(DestN);
+            assert(Offsets.count(DestN) && "offset not found for dest node");
             unsigned Offset = Offsets.at(DestN) + DestNH.getOffset();
             auto *Addr = Transforms.at(GroupId)->ComputeAddress(
                 TripleMap.at(Dest), Offset, InsertPt);
-            auto *Ptr = CastInst::CreatePointerCast(Addr, Dest->getType(),
+            auto *Ptr = CastInst::CreatePointerCast(Addr, PointerType::getUnqual(Src->getType()),
                                                     I->getName(), InsertPt);
             updateValue(Dest, Addr);
             updateValue(Dest, Ptr);
@@ -1724,7 +1751,7 @@ void LayoutTuner::applyTransformation(
           // also propagate the group tag
           TargetMapTy TargetsInCallee = TransTargets;
           RefSetTracker<TargetMapTy> CalleeRefs;
-          OffsetMapTy CalleeOffsets;
+          OffsetMapTy CalleeOffsets = DefaultOffsets; 
           errs() << "Caller Graph: " << CallerG << ", Callee Graph" << CalleeG
                  << '\n';
           if (CallerG != CalleeG) {
@@ -1745,11 +1772,7 @@ void LayoutTuner::applyTransformation(
                 errs() << "TARGET MAPPING " << CallerN << " -> " << CalleeN << '\n';
                 unsigned GroupId = It->second;
                 TargetsInCallee[CalleeN] = GroupId;
-                if (SameSCC) {
-                  CalleeOffsets[CalleeN] = Offsets.at(CallerN);
-                } else {
-                  CalleeOffsets[CalleeN] = Offsets.at(CallerN) + Mapping.second.getOffset();
-                }
+                CalleeOffsets[CalleeN] = Offsets.at(CallerN) + Mapping.second.getOffset();
               }
             }
             CalleeRefs =
@@ -2045,7 +2068,6 @@ FunctionType *
 LayoutTuner::computeCloneFnTy(CallSite CS,
                               const RefSetTracker<TargetMapTy> &Refs) {
   errs() << "----- computing clone fn ty\n";
-  errs() << "~~~~~~ " << *CS.getInstruction() << '\n';
 
   Function *Caller = CS.getParent()->getParent(),
            *Callee = CS.getCalledFunction();
@@ -2067,7 +2089,6 @@ LayoutTuner::computeCloneFnTy(CallSite CS,
       ArgTypes.push_back(Int64Ty);
       ArgTypes.push_back(Int64Ty);
     } else {
-      errs() << "ARG: " << *getOrigValue(Arg) << '\n';
       ArgTypes.push_back(getNewType(const_cast<Value *>(getOrigValue(Arg)),
                                     getNodeForValue(Arg, Caller), Refs));
     }
@@ -2120,6 +2141,7 @@ bool LayoutTuner::shouldCloneFunction(
   return false;
 }
 
+// FIXME: need to remove nodes refered by type-unsafe node
 TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   std::vector<const DSNode *> Candidates;
   auto &TypeChecker = getAnalysis<TypeSafety<EquivBUDataStructures>>();
@@ -2130,12 +2152,20 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   std::map<const DSNode *, std::set<unsigned>> NodesWithZeroOffset;
   std::set<unsigned> Disqualified;
 
+  auto FindTargetsReferred = [&TargetMaps](const DSNode *N, std::set<unsigned> &TargetsReferred) {
+    auto &Targets = TargetMaps[N->getParentGraph()];
+    for (auto ei = N->edge_begin(), ee = N->edge_end(); ei != ee; ++ei) {
+      auto It = Targets.find(ei->second.getNode());
+      if (It != Targets.end())
+        insertInto(TargetsReferred, It->second);
+    }
+  };
+
   // find typesafe local nodes in each graph
   for (auto *G : SortedSCCs)
     for (auto ni = G->node_begin(), ne = G->node_end(); ni != ne; ++ni) {
       DSNode *N = &*ni;
       if (!N->isGlobalNode() && N->getSize() > MinSize && 
-          N->isHeapNode() &&
           TypeChecker.isTypeSafe(N))
         LocalNodes[G].insert(N);
     }
@@ -2143,18 +2173,11 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   bool Changed;
   bool FirstPass = true;
   
-  //
-  // a) find out all unique type-safe targets n s.t. given
-  //    a corresponding node m in a DSGraph n's offset 
-  //    from m is constant regardless calling context
-  // b) find out which nodes has zero offset with a target
-  //
   auto *GG = DSA->getGlobalsGraph();
   auto &GlobalTargets = TargetMaps[GG];
   for (auto ni = GG->node_begin(), ne = GG->node_end(); ni != ne; ++ni) {
       DSNode *N = &*ni;
       if (!N->isGlobalNode() && N->getSize() > MinSize && TypeChecker.isTypeSafe(N) &&
-          N->isHeapNode() &&
           !refersTargets(N, NodeSetTy {N}) &&
           !refersTargets(N, GlobalTargets)) {
         unsigned TargetId = Candidates.size();
@@ -2162,6 +2185,13 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
         GlobalTargets[N].insert(TargetId);
       }
   }
+
+  //
+  // a) find out all unique type-safe targets n s.t. given
+  //    a corresponding node m in a DSGraph n's offset 
+  //    from m is constant regardless calling context
+  // b) find out which nodes has zero offset with a target
+  //
   do {
     Changed = false;
     for (auto *G : SortedSCCs) {
@@ -2192,13 +2222,13 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
       for (const auto &Pair : Targets) {
         const DSNode *N = Pair.first;
         auto &TargetIds = Pair.second;
-        bool RefersTargets = false;
         for (auto ei = N->edge_begin(), ee = N->edge_end(); ei != ee; ++ei) {
           auto It = Targets.find(ei->second.getNode());
           if (It == Targets.end())
             continue;
-          for (unsigned TargetId : It->second)
-            if (!Disqualified.count(TargetId)) {
+          bool RefersTargets = false;
+          for (unsigned ReferredTargetId : It->second)
+            if (!Disqualified.count(ReferredTargetId)) {
               insertInto(Disqualified, TargetIds);
               RefersTargets = true;
               break;
@@ -2209,6 +2239,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
       }
 
       std::map<std::pair<const DSNode *, const DSNode *>, unsigned> RelOffsets;
+
       // propagate targets to successor
       // during propagation we also check that for every mapping from
       // DSNode v to DSNode w, there's only one unique offset.
@@ -2217,37 +2248,83 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
         const auto &CalleeCallerMapping = getCalleeCallerMapping(Edge);
         auto *CalleeG = DSA->getDSGraph(*Edge.second);
         for (auto Mapping : CalleeCallerMapping) {
-          const DSNode *CallerN = Mapping.first;
-          if (!Targets.count(CallerN))
+          const DSNode *CalleeN;
+          DSNodeHandle CallerNH;
+          std::tie(CalleeN, CallerNH) = Mapping;
+          if (!Targets.count(CallerNH.getNode()))
             continue;
 
-          DSNodeHandle CalleeNH = Mapping.second;
-          auto OffsetIt = RelOffsets.find({CallerN, CalleeNH.getNode()});
-          auto &TargetIds = Targets.at(CallerN);
-          if (OffsetIt != RelOffsets.end() && OffsetIt->second != CalleeNH.getOffset()) {
+          auto OffsetIt = RelOffsets.find({CallerNH.getNode(), CalleeN});
+          auto &TargetIds = Targets.at(CallerNH.getNode());
+          if (OffsetIt != RelOffsets.end() && OffsetIt->second != CallerNH.getOffset()) {
             // we've already found this mapping
             // check that their's only one relative offset
-            Disqualified.insert(TargetIds.begin(), TargetIds.end());
-            continue;
+            insertInto(Disqualified, TargetIds);
           } 
 
-          RelOffsets[{CallerN, CalleeNH.getNode()}] = CalleeNH.getOffset();
+          RelOffsets[{CallerNH.getNode(), CalleeN}] = CallerNH.getOffset();
 
-          auto &CalleeTargetIds = TargetMaps[CalleeG][CalleeNH.getNode()];
+          auto &CalleeTargetIds = TargetMaps[CalleeG][CalleeN];
           unsigned OldSize = CalleeTargetIds.size();
-          CalleeTargetIds.insert(TargetIds.begin(), TargetIds.end());
+          insertInto(CalleeTargetIds, TargetIds);
           Changed |= (CalleeTargetIds.size() != OldSize);
 
-          if (CalleeNH.getOffset() == 0)
-            NodesWithZeroOffset[CalleeNH.getNode()].insert(
-                NodesWithZeroOffset[CallerN].begin(),
-                NodesWithZeroOffset[CallerN].end());
+          if (CallerNH.getOffset() == 0)
+            NodesWithZeroOffset[CalleeN].insert(
+                NodesWithZeroOffset[CallerNH.getNode()].begin(),
+                NodesWithZeroOffset[CallerNH.getNode()].end());
         }
       }
     }
 
     FirstPass = false;
   } while (Changed);
+
+  // now filter out nodes referred by type-unsafe nodes
+  for (auto &GraphAndTargets : TargetMaps) {
+    const DSGraph *G = GraphAndTargets.first;
+    auto &Targets = GraphAndTargets.second;
+    for (auto ni = G->node_begin(), ne = G->node_end(); ni != ne; ++ni) {
+      const DSNode *N = &*ni;
+      if (!TypeChecker.isTypeSafeIfInternal(N))
+        FindTargetsReferred(N, Disqualified);
+    }
+  }
+
+  // There are certain patterns of global pointer to targets that we support
+  // filter out those that aren't. These cases are rare and not worth supporting
+  // for now...
+  for (auto &G : M.globals()) {
+    auto NH = GG->getNodeForValue(&G);
+    auto *N = NH.getNode();
+    if (!N)
+      continue;
+    
+    std::set<unsigned> GlobalsReferred;
+    FindTargetsReferred(N, GlobalsReferred);
+
+    if (!GlobalsReferred.empty()) {
+      // for now, to simplify transformation,
+      // we support handling global that refers to target
+      // only if the global is declared with type infered by DSA
+      unsigned SizeNeeded = computeSizeWithTripleConv(N, GlobalTargets);
+      auto *TyAfterConv =
+          cast<PointerType>(getNewType(const_cast<GlobalVariable *>(&G), NH,
+                                       RefSetTracker<decltype(GlobalTargets)>(GlobalTargets)))
+              ->getElementType();
+      if (TD->getTypeAllocSize(TyAfterConv) != SizeNeeded) {
+        insertInto(Disqualified, GlobalsReferred);
+        continue;
+      }
+
+      // for now only allow such globals to be used in instructions directly
+      for (auto *U : G.users())
+        if (isa<Constant>(U)) {
+          insertInto(Disqualified, GlobalsReferred);
+          continue;
+        }
+    }
+  }
 
   // 1) make sure that a gep either
   //    a) index with a constant offset
@@ -2286,7 +2363,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           APInt RelOffset(TD->getPointerSizeInBits(GEP->getAddressSpace()), 0);
           bool HasConstOffset = GEP->accumulateConstantOffset(*TD, RelOffset);
           if (!HasConstOffset)
-            CantChangeIdx.insert(CantChangeIdx.begin(), CantChangeIdx.end());
+            insertInto(Disqualified, CantChangeIdx);
         } else if (auto CS = CallSite(const_cast<Instruction *>(&I))) {
           //
           // make sure no indirect call can access any target
@@ -2346,8 +2423,10 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
 
   TargetMapTy LegalTargets;
   for (unsigned i = 0, e = Candidates.size(); i != e; i++)
-    if (!Disqualified.count(i))
+    if (!Disqualified.count(i)) {
       LegalTargets[Candidates[i]] = LegalTargets.size();
+      assert(TypeChecker.isTypeSafe(Candidates[i]));
+    }
 
   return LegalTargets;
 }
