@@ -312,13 +312,7 @@ class LayoutTuner : public ModulePass {
           CalleeTracker.RefRecords[CalleeN] =
               RefRecord(CallerNH, CalleeN, CallerRefRecord);
         } else if (auto Ref = RefRecord(CallerN, Targets)) {
-          errs() << "Caller size: " << CallerN->getSize() << '\n';
-          errs() << "Callee size: " << CalleeN->getSize() << '\n';
-          errs() << "Callee offset: " << CallerNH.getOffset() << '\n';
           CalleeTracker.RefRecords[CalleeN] = RefRecord(CallerNH, CalleeN, Ref);
-          errs() << "CALLEE HAS REF? "
-                 << CalleeTracker.RefRecords.at(CalleeN).hasReferences()
-                 << '\n';
         }
       }
 
@@ -1279,6 +1273,10 @@ static bool isUnsupportedLibCall(const Function *F) {
 //        and use that size when allocate these objects
 // TODO: handle memcpy, memmove, and memset
 // TODO: try *really hard* to think about why the way we processing function works (I think?)
+// TODO: emit alias.scope metadata for transformed loads/stores.
+//       Two memory accesses don't alias if
+//          1) they are associated with two targets
+//       or 2) they have different offsets
 // -- push orig functions on to worklist first, and don't process functions that should be clone
 //
 // FIXME: Should record size of target/target-ref on top level, since once once
@@ -1398,9 +1396,6 @@ void LayoutTuner::applyTransformation(
         auto NH = getNodeForValue(&*I, F);
         auto *N = NH.getNode();
 
-        assert(!isa<ExtractValueInst>(&*I) && !isa<InsertValueInst>(&*I) &&
-               "doesn't support extractvalue or insertvalue yet");
-
         for (unsigned i = 0, e = I->getNumOperands();
             i != e; i++) {
           auto &Op = I->getOperandUse(i);
@@ -1443,7 +1438,7 @@ void LayoutTuner::applyTransformation(
               Constant *TargetSize = Transforms.at(GroupId)->getOrigSize(),
                        *AbsOffset = ConstantInt::get(TargetSize->getType(),
                            RelOffset + Offsets.at(SrcNH.getNode()) + SrcNH.getOffset());
-              auto *Diff = BinaryOperator::CreateURem(AbsOffset, TargetSize, "", InsertPt);
+              auto *Diff = BinaryOperator::CreateUDiv(AbsOffset, TargetSize, "", InsertPt);
               NewTriple.Idx = BinaryOperator::CreateNSWAdd(
                   OldTriple.Idx, Diff, "updated_idx", InsertPt);
             }
@@ -1503,7 +1498,6 @@ void LayoutTuner::applyTransformation(
             auto *Ptr = CastInst::CreatePointerCast(
                 Addr, LI->getPointerOperand()->getType(), I->getName(),
                 InsertPt);
-
             updateValue(LI->getPointerOperand(), Addr);
             updateValue(LI->getPointerOperand(), Ptr);
             auto *NewLoad = new LoadInst(Ptr, "transformedLoad", InsertPt);
@@ -2163,7 +2157,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   for (auto *G : SortedSCCs)
     for (auto ni = G->node_begin(), ne = G->node_end(); ni != ne; ++ni) {
       DSNode *N = &*ni;
-      if (!N->isGlobalNode() && N->getSize() > MinSize && 
+      if (!N->isGlobalNode() && N->getSize() >= MinSize && 
           TypeChecker.isTypeSafe(N))
         LocalNodes[G].insert(N);
     }
@@ -2175,7 +2169,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   auto &GlobalTargets = TargetMaps[GG];
   for (auto ni = GG->node_begin(), ne = GG->node_end(); ni != ne; ++ni) {
       DSNode *N = &*ni;
-      if (!N->isGlobalNode() && N->getSize() > MinSize && TypeChecker.isTypeSafe(N) &&
+      if (!N->isGlobalNode() && N->getSize() >= MinSize && TypeChecker.isTypeSafe(N) &&
           !refersTargets(N, NodeSetTy {N}) &&
           !refersTargets(N, GlobalTargets)) {
         unsigned TargetId = Candidates.size();
@@ -2278,17 +2272,6 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
     FirstPass = false;
   } while (Changed);
 
-  // now filter out nodes referred by type-unsafe nodes
-  for (auto &GraphAndTargets : TargetMaps) {
-    const DSGraph *G = GraphAndTargets.first;
-    auto &Targets = GraphAndTargets.second;
-    for (auto ni = G->node_begin(), ne = G->node_end(); ni != ne; ++ni) {
-      const DSNode *N = &*ni;
-      if (!TypeChecker.isTypeSafeIfInternal(N))
-        FindTargetsReferred(N, Disqualified);
-    }
-  }
-
   // There are certain patterns of global pointer to targets that we support
   // filter out those that aren't. These cases are rare and not worth supporting
   // for now...
@@ -2381,14 +2364,15 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
 
             for (auto *N : ReachableNodes) {
               auto It = Targets.find(N);
-              if (It != Targets.end())
+              if (It != Targets.end()) {
                 Disqualified.insert(It->second.begin(), It->second.end());
+              }
               for (auto ei = N->edge_begin(), ee = N->edge_end();
                   ei != ee; ++ei) {
                 const DSNode *M = ei->second.getNode();
                 auto It = Targets.find(M);
-                  if (It != Targets.end())
-                    Disqualified.insert(It->second.begin(), It->second.end());
+                if (It != Targets.end())
+                  Disqualified.insert(It->second.begin(), It->second.end());
               }
             }
 
@@ -2413,15 +2397,40 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           bool HasDefinition = Callee && (
               isDeallocator(Callee) || isAllocator(Callee) || !Callee->isDeclarationForLinker());
           if (!Callee ||
-              (!HasDefinition || isUnsupportedLibCall(Callee))) {
+              (!HasDefinition || isUnsupportedLibCall(Callee)))
             Disqualified.insert(TargetsUsed.begin(), TargetsUsed.end());
-          }
+        } else if (auto *IV = dyn_cast<InsertValueInst>(&I)) {
+          auto *N = G->getNodeForValue(IV->getAggregateOperand()).getNode();
+          auto It = Targets.find(N);
+          if (It != Targets.end())
+            insertInto(Disqualified, It->second);
+        }  else if (auto *EV = dyn_cast<ExtractValueInst>(&I)) {
+          auto *N = G->getNodeForValue(EV->getAggregateOperand()).getNode();
+          auto It = Targets.find(N);
+          if (It != Targets.end())
+            insertInto(Disqualified, It->second);
         }
+  }
+
+  // now filter out nodes referred by type-unsafe nodes
+  for (auto &GraphAndTargets : TargetMaps) {
+    const DSGraph *G = GraphAndTargets.first;
+    auto &Targets = GraphAndTargets.second;
+    for (auto ni = G->node_begin(), ne = G->node_end(); ni != ne; ++ni) {
+      const DSNode *N = &*ni;
+      if (!TypeChecker.isTypeSafeIfInternal(N))
+        FindTargetsReferred(N, Disqualified);
+    }
   }
 
   TargetMapTy LegalTargets;
   for (unsigned i = 0, e = Candidates.size(); i != e; i++)
     if (!Disqualified.count(i)) {
+      auto *N = Candidates[i];
+      if (N->getParentGraph() == GG)
+        errs() << "GROUP " << LegalTargets.size()-1 << " is in globals graph\n";
+      else
+        errs() << "GROUP " << LegalTargets.size()-1 << " is in SCC of " << N->getParentGraph()->retnodes_begin()->first->getName() << '\n';
       LegalTargets[Candidates[i]] = LegalTargets.size();
       assert(TypeChecker.isTypeSafe(Candidates[i]));
     }
