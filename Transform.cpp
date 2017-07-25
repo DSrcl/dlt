@@ -76,7 +76,6 @@ std::unique_ptr<LayoutDataType> TransformPool::apply(const LayoutDataType &Layou
 }
 
 void FactorTransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** FACTOR\n";
   if (Layout->getDims().empty())
     return;
 
@@ -90,7 +89,6 @@ void FactorTransform::transform(LayoutDataType *Layout) const {
 }
 
 void SOATransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** SOA\n";
   auto *Struct = dyn_cast<LayoutStruct>(Layout);
 
   // noop if the input is not a struct
@@ -111,7 +109,6 @@ void SOATransform::transform(LayoutDataType *Layout) const {
 }
 
 void AOSTransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** AOS\n";
   auto *Struct = dyn_cast<LayoutStruct>(Layout);
 
   if (!Struct)
@@ -149,7 +146,6 @@ void AOSTransform::transform(LayoutDataType *Layout) const {
 }
 
 void StructTransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** STRUCT\n";
   auto *Struct = dyn_cast<LayoutStruct>(Layout);
 
   if (!Struct || Struct->getFields().size() <= 2)
@@ -163,7 +159,6 @@ void StructTransform::transform(LayoutDataType *Layout) const {
 }
 
 void StructFlattenTransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** FLATTENING\n";
   auto *Struct = dyn_cast<LayoutStruct>(Layout);
   if (!Struct)
     return;
@@ -174,7 +169,6 @@ void StructFlattenTransform::transform(LayoutDataType *Layout) const {
 }
 
 void InterchangeTransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** INTERCHANGE\n";
   auto Dims = Layout->getDims();
 
   // not enough dimensions to interchange
@@ -187,7 +181,6 @@ void InterchangeTransform::transform(LayoutDataType *Layout) const {
 }
 
 void SwapTransform::transform(LayoutDataType *Layout) const {
-  errs() << "*** SWAP\n";
   auto *Struct = dyn_cast<LayoutStruct>(Layout);
   if (!Struct)
     return;

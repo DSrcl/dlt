@@ -37,8 +37,6 @@ double evaluate(Module &M, const std::vector<std::string> &Args) {
     BcOut.keep();
   }
   
-  errs() << "Bitcode : " << Bitcode << '\n';
-
   const char *CompileArgs[] = { "clang", Bitcode.data(), "-O3", "-o", Exe.data(), nullptr };
   if (sys::ExecuteAndWait(Clang, CompileArgs)) {
     exit(1);
