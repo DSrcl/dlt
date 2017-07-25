@@ -18,7 +18,7 @@ namespace {
 }
 
 double evaluate(Module &M, const std::vector<std::string> &Args) {
-  std::string Clang = ExitOnErr(errorOrToExpected(sys::findProgramByName("clang")));
+  std::string Clang = ExitOnErr(errorOrToExpected(sys::findProgramByName("clang++")));
   SmallVector<char, 64> Bitcode, Exe;
   ExitOnErr(errorCodeToError(sys::fs::createTemporaryFile("", "bc", Bitcode)));
   ExitOnErr(errorCodeToError(sys::fs::createTemporaryFile("", "", Exe)));
@@ -37,7 +37,7 @@ double evaluate(Module &M, const std::vector<std::string> &Args) {
     BcOut.keep();
   }
   
-  const char *CompileArgs[] = { "clang", Bitcode.data(), "-O3", "-o", Exe.data(), nullptr };
+  const char *CompileArgs[] = { "clang++", Bitcode.data(), "-O3", "-o", Exe.data(), nullptr };
   if (sys::ExecuteAndWait(Clang, CompileArgs)) {
     exit(1);
   }

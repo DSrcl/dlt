@@ -1,5 +1,6 @@
 #include "Layout.h"
 #include "dsa/DSGraph.h"
+#include <memory>
 
 using namespace llvm;
 
@@ -167,9 +168,9 @@ void LayoutStruct::mergeFields(unsigned Begin, unsigned End) {
   std::vector<LayoutStruct::Field> FieldsToMerge(
       std::make_move_iterator(BeginIt),
       std::make_move_iterator(EndIt));
-  auto MergedField = std::make_unique<LayoutStruct>(FieldsToMerge, TD);
+  auto MergedField = make_unique<LayoutStruct>(FieldsToMerge, TD);
   Fields.erase(std::next(BeginIt), EndIt);
-  *BeginIt = {-1, std::move(MergedField)};
+  *BeginIt = std::make_pair(-1, std::move(MergedField));
 }
 
 void LayoutStruct::flatten(unsigned i) {

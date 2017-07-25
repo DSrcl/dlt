@@ -2,6 +2,7 @@
 #define EVALUATE_H
 
 #include <vector>
+#include <string>
 
 namespace llvm {
   class Module;

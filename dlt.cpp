@@ -975,16 +975,16 @@ bool LayoutTuner::runOnModule(Module &M) {
   TargetMapTy TargetsInGG;
 
   TransformPool TP;
-  TP.addTransform(std::make_unique<FactorTransform>(4), 0.05);
-  TP.addTransform(std::make_unique<FactorTransform>(8), 0.05);
-  TP.addTransform(std::make_unique<FactorTransform>(16), 0.05);
-  TP.addTransform(std::make_unique<FactorTransform>(32), 0.05);      // 0.2
-  TP.addTransform(std::make_unique<StructTransform>(), 0.15);        // 0.35
-  TP.addTransform(std::make_unique<StructFlattenTransform>(), 0.15); // 0.5
-  TP.addTransform(std::make_unique<SOATransform>(), 0.15);           // 0.65
-  TP.addTransform(std::make_unique<AOSTransform>(), 0.15);           // 0.8
-  TP.addTransform(std::make_unique<SwapTransform>(), 0.05);          // 0.85
-  TP.addTransform(std::make_unique<InterchangeTransform>(), 0.05);   // 0.85
+  TP.addTransform(make_unique<FactorTransform>(4), 0.05);
+  TP.addTransform(make_unique<FactorTransform>(8), 0.05);
+  TP.addTransform(make_unique<FactorTransform>(16), 0.05);
+  TP.addTransform(make_unique<FactorTransform>(32), 0.05);      // 0.2
+  TP.addTransform(make_unique<StructTransform>(), 0.15);        // 0.35
+  TP.addTransform(make_unique<StructFlattenTransform>(), 0.15); // 0.5
+  TP.addTransform(make_unique<SOATransform>(), 0.15);           // 0.65
+  TP.addTransform(make_unique<AOSTransform>(), 0.15);           // 0.8
+  TP.addTransform(make_unique<SwapTransform>(), 0.05);          // 0.85
+  TP.addTransform(make_unique<InterchangeTransform>(), 0.05);   // 0.85
 
   unsigned i = 0;
   auto *GG = DSA->getGlobalsGraph();
@@ -2059,6 +2059,7 @@ void LayoutTuner::applyTransformation(
             if (!RetVal || !Targets.count(getNodeForValue(RetVal, F).getNode()))
               continue;
 
+            assert(TripleMap.count(RetVal));
             auto &Triple = TripleMap.at(RetVal);
             auto SizeAddr = F->getArgumentList().rbegin(),
                  IdxAddr = std::next(SizeAddr), BaseAddr = std::next(IdxAddr);
@@ -2610,6 +2611,15 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           if (It != Targets.end())
             insertInto(Disqualified, It->second);
           FindTargetsReferred(N, Disqualified);
+        } else if (auto *SL = dyn_cast<SelectInst>(&I)) {
+          // Sigh... This is easy to handle
+          // but I am too lazy and desperate to do it now
+          auto *N = G->getNodeForValue(SL).getNode();
+          auto It = Targets.find(N);
+          if (It != Targets.end())
+            insertInto(Disqualified, It->second);
+          if (N)
+            FindTargetsReferred(N, Disqualified);
         }
   }
 
