@@ -22,8 +22,8 @@ void LayoutState::revert() {
 }
 
 void LayoutState::reset() {
-  Prev.reset();
-  Cur.reset();
+  Prev = Cur;
+  Cur = Orig;
 }
 
 const LayoutDataType *LayoutState::getLayout() const {

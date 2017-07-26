@@ -92,8 +92,6 @@ cl::opt<unsigned>
     Iterations("iters", cl::desc("Number of iterations to run the tuner with"),
                cl::init(4));
 
-cl::opt<double> Beta("beta", cl::desc("MCMC parameters"), cl::init(1.0));
-
 double randProb() { return std::rand() / double(RAND_MAX); }
 
 struct IndexTriple {
@@ -144,12 +142,14 @@ class TransformLowering {
 protected:
   StructType *TargetTy;
   Constant *ElemSize;
+  unsigned Size;
   std::map<unsigned, unsigned> Offset2IdxMap;
 
   TransformLowering(const DSNode *Target);
 
 public:
   Constant *getOrigSize() const { return ElemSize; }
+  unsigned getSize() const { return Size; }
 
   // compute the address of an element after transformation
   virtual Value *ComputeAddress(IndexTriple Triple, unsigned Offset,
@@ -641,6 +641,7 @@ TransformLowering::TransformLowering(const DSNode *Target) {
   }
   LLVMContext &Ctx = Fields[0]->getContext();
   TargetTy = StructType::get(Ctx, Fields);
+  Size = Target->getSize();
   ElemSize = ConstantInt::get(Type::getInt64Ty(Ctx), Target->getSize());
   DEBUG(errs() << "TARGET TYPE: " << *TargetTy << '\n');
 }
@@ -1019,6 +1020,9 @@ bool LayoutTuner::runOnModule(Module &M) {
 
   TransformState State(OrigLayouts, TP, MutateProb, ResetProb);
   double CurCost = std::numeric_limits<double>::max();
+  double TMin = 0.01, TMax = 0.5,
+         T = TMax, Alpha = std::pow(TMin/TMax, 1.0/double(Iterations));
+  errs() << "T = " << T << ", ALPHA = " << Alpha << '\n';
   for (int i = 0; i < Iterations; i++) {
     setTransforms(State.getLayouts());
 #if 0
@@ -1067,9 +1071,12 @@ bool LayoutTuner::runOnModule(Module &M) {
         exit(1);
       }
       State.setCost(Cost);
-      errs() << "cost = " << Cost << ", best = " << CurCost << '\n';
-      bool Accept =
-          (Cost < CurCost || randProb() < std::exp(-Beta * Cost / CurCost));
+      double AcceptProb = std::min<double>(std::exp((CurCost-Cost)/T), 1),
+             P = randProb();
+      errs() << "new = " << Cost << ", cur = " << CurCost
+        << ", accept prob = " << AcceptProb
+        << ", p = " << P << '\n';
+      bool Accept = P < AcceptProb;
       if (!Accept)
         State.revert();
       else
@@ -1079,6 +1086,7 @@ bool LayoutTuner::runOnModule(Module &M) {
 
     State.mutate();
 #endif
+    T *= Alpha;
   }
 
   setTransforms(State.getBest());
@@ -1579,8 +1587,9 @@ void LayoutTuner::applyTransformation(
             IndexTriple &NewTriple = TripleMap[GEP] = OldTriple;
             Instruction *InsertPt = &*std::next(I);
 
+            unsigned GroupId = Targets.lookup(N);
             // Update Idx
-            if (TD->getTypeAllocSize(OrigSrcTy) == N->getSize()) {
+            if (TD->getTypeAllocSize(OrigSrcTy) == Transforms.at(GroupId)->getSize()) {
               // FIXME this is broken
               // -- consider this example `gep {[1 x i32]}`
               // This should be fixed fairly easily by implementing something
@@ -1969,7 +1978,9 @@ void LayoutTuner::applyTransformation(
             unsigned i = 0;
             for (Value *Arg : CS.args()) {
               if (Targets.count(getNodeForValue(Arg, F).getNode())) {
-                DEBUG(errs() << "Looking up triple for " << Arg << "\n");
+                if (!TripleMap.count(Arg))
+                  errs() << "DAFUQ " << *CS.getInstruction() << '\n';
+                DEBUG(errs() << "Looking up triple for " << *Arg << "\n");
                 auto &Triple = TripleMap.at(Arg);
                 assert(Triple.Base);
                 NewArgs.push_back(Triple.Base);
@@ -2610,7 +2621,8 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           auto It = Targets.find(N);
           if (It != Targets.end())
             insertInto(Disqualified, It->second);
-          FindTargetsReferred(N, Disqualified);
+          if (N)
+            FindTargetsReferred(N, Disqualified);
         } else if (auto *SL = dyn_cast<SelectInst>(&I)) {
           // Sigh... This is easy to handle
           // but I am too lazy and desperate to do it now
