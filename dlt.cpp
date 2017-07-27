@@ -9,6 +9,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -37,6 +38,7 @@
 
 #include <limits>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define DEBUG_TYPE "dlt"
 
@@ -92,7 +94,11 @@ cl::opt<unsigned>
     Iterations("iters", cl::desc("Number of iterations to run the tuner with"),
                cl::init(4));
 
-double randProb() { return std::rand() / double(RAND_MAX); }
+double randProb() {
+  static std::default_random_engine Ngn;
+  static std::uniform_real_distribution<double> Dist(0.0,1.0);
+  return Dist(Ngn);
+}
 
 struct IndexTriple {
   Value *Base, *Idx, *Size;
@@ -203,28 +209,32 @@ public:
 // a set of target nodes tagged with its group idx
 typedef DenseMap<const DSNode *, unsigned> TargetMapTy;
 
-class TargetSetTy {
+// mapping a DSNode's offset from a target node
+typedef DenseMap<const DSNode *, unsigned> OffsetMapTy;
+
+class CloneSignature {
   std::vector<std::pair<const DSNode *, unsigned>> Targets;
+  std::vector<std::pair<const DSNode *, unsigned>> Offsets;
+  Function *Src;
 
 public:
-  TargetSetTy(TargetMapTy TheTargets) {
+  CloneSignature(TargetMapTy TheTargets, OffsetMapTy TheOffsets, Function *TheSrc)
+  : Src(TheSrc) {
     for (auto TargetAndGroup : TheTargets)
       Targets.push_back(TargetAndGroup);
+    for (auto TargetAndOffset : TheOffsets)
+      Offsets.push_back(TargetAndOffset);
   }
 
-  bool operator<(const TargetSetTy Other) const {
-    return Targets < Other.Targets;
+  bool operator<(const CloneSignature &Other) const {
+    return std::tie(Targets, Offsets, Src) < std::tie(Other.Targets, Other.Offsets, Other.Src);
   }
 };
 
 class LayoutTuner : public ModulePass {
   typedef std::set<const DSNode *> NodeSetTy;
-  typedef std::pair<TargetSetTy, Function *> CloneSignature;
   // edge between two SCCs
   typedef std::pair<CallSite, const Function *> CallEdgeTy;
-  // mapping a DSNode's offset from a target node
-  typedef DenseMap<const DSNode *, unsigned> OffsetMapTy;
-
   // target datalayout
   const DataLayout *TD;
   DataStructures *DSA;
@@ -493,7 +503,8 @@ class LayoutTuner : public ModulePass {
                                  const RefSetTracker<TargetMapTy> &);
   Function *cloneFunctionWithNewType(Function *Src, FunctionType *FnTy,
                                      const TargetMapTy &Targets,
-                                     std::map<Value *, IndexTriple> &TripleMap);
+                                     std::map<Value *, IndexTriple> &TripleMap,
+                                     CloneSignature &Sig);
   std::vector<DSGraph *> SortedSCCs;
   std::map<DSGraph *, unsigned> SCCToOrderMap;
   std::map<DSGraph *, std::vector<CallEdgeTy>> OutgoingEdges;
@@ -857,7 +868,8 @@ LayoutTuner::computeSizeWithTripleConv(const DSNode *N,
 //
 Function *LayoutTuner::cloneFunctionWithNewType(
     Function *Src, FunctionType *FnTy, const TargetMapTy &Targets,
-    std::map<Value *, IndexTriple> &TripleMap) {
+    std::map<Value *, IndexTriple> &TripleMap,
+    CloneSignature &Sig) {
   ValueToValueMapTy ValueMap;
   auto *Clone = CloneFunction(Src, ValueMap);
   Clone->setVisibility(Function::DefaultVisibility);
@@ -866,7 +878,7 @@ Function *LayoutTuner::cloneFunctionWithNewType(
   auto *NewF = Function::Create(FnTy, Function::InternalLinkage);
 
   auto &CloneRecord = CloneRecords[NewF];
-  CloneCache[{Targets, getSrcFunc(Src)}] = NewF;
+  CloneCache[Sig] = NewF;
 
   //
   // map values from clone back to src function
@@ -891,6 +903,9 @@ Function *LayoutTuner::cloneFunctionWithNewType(
   Clone->getParent()->getFunctionList().insert(Clone->getIterator(), NewF);
   NewF->takeName(Clone);
   NewF->getBasicBlockList().splice(NewF->begin(), Clone->getBasicBlockList());
+
+  if (Src->hasPersonalityFn())
+    NewF->setPersonalityFn(Src->getPersonalityFn());
 
   // transfer arguments from Clone to NewF
   for (auto I = Clone->arg_begin(), E = Clone->arg_end(),
@@ -925,21 +940,20 @@ Function *LayoutTuner::cloneFunctionWithNewType(
 
 // TODO: support c++ allocators
 bool LayoutTuner::isAllocator(const Function *F) {
-  // return std::any_of(
-  //    AllocIdentifier->alloc_begin(), AllocIdentifier->alloc_end(),
-  //    [&](const std::string Name) {
-  //    return F->getName() == Name; });
   StringRef Name = F->getName();
-  return Name == "malloc" || Name == "calloc";
+  return Name == "malloc" || Name == "calloc" ||
+    Name == "_Znwm" ||
+    Name == "_Znam" ||
+    Name == "_Znwj" ||
+    Name == "_Znaj";
 }
 
 // TODO: support c++ deallocators
 bool LayoutTuner::isDeallocator(const Function *F) {
-  // return std::any_of(
-  //    AllocIdentifier->dealloc_begin(), AllocIdentifier->dealloc_end(),
-  //    [&](const std::string Name) { return F->getName() == Name; });
   StringRef Name = F->getName();
-  return Name == "free";
+  return Name == "free" ||
+    Name == "_ZdlPv" ||
+    Name == "_ZdaPv";
 }
 
 bool LayoutTuner::runOnModule(Module &M) {
@@ -1020,15 +1034,13 @@ bool LayoutTuner::runOnModule(Module &M) {
 
   TransformState State(OrigLayouts, TP, MutateProb, ResetProb);
   double CurCost = std::numeric_limits<double>::max();
-  double TMin = 0.01, TMax = 0.5,
+  double TMin = 0.001, TMax = 0.05,
          T = TMax, Alpha = std::pow(TMin/TMax, 1.0/double(Iterations));
   errs() << "T = " << T << ", ALPHA = " << Alpha << '\n';
   for (int i = 0; i < Iterations; i++) {
     setTransforms(State.getLayouts());
 #if 0
     applyTransformation(M, Targets, TargetsInGG, Transforms);
-    cleanupDeadValues();
-    errs() << evaluate(M, TestArgv) << '\n';
     break;
 #endif
 
@@ -1063,12 +1075,16 @@ bool LayoutTuner::runOnModule(Module &M) {
       double Cost;
       close(PipeOut);
       ssize_t BytesRead = read(PipeIn, &Cost, sizeof Cost);
+      int Stat;
+      waitpid(Child, &Stat, 0);
       if (BytesRead < 0) {
         errs() << "Failed to read from pipe\n";
         exit(1);
       } else if (BytesRead != sizeof Cost) {
         errs() << "Failed to evaluate layout\n";
-        exit(1);
+        State.revert();
+        State.mutate();
+        continue;
       }
       State.setCost(Cost);
       double AcceptProb = std::min<double>(std::exp((CurCost-Cost)/T), 1),
@@ -1557,8 +1573,10 @@ void LayoutTuner::applyTransformation(
     //
     std::map<Value *, std::vector<IncomingTripleTy>> IncomingValues;
 
-    for (auto &BB : *F) {
-      auto I = BB.begin(), E = BB.end(), NextIt = std::next(I);
+    // make sure we visit the definition of a value before its use
+    // with exception to PHIs
+    for (BasicBlock *BB : ReversePostOrderTraversal<Function *>(F)) {
+      auto I = BB->begin(), E = BB->end(), NextIt = std::next(I);
       for (; I != E; I = NextIt, ++NextIt) {
         auto NH = getNodeForValue(&*I, F);
         auto *N = NH.getNode();
@@ -1637,6 +1655,29 @@ void LayoutTuner::applyTransformation(
             GEP->mutateType(ResultTy);
           }
         } // end of handling GEP
+
+        auto *SL = dyn_cast<SelectInst>(&*I);
+        if (SL && Targets.count(N)) {
+          DEBUG(errs() << "--- handling select\n");
+          IndexTriple TrueTriple, FalseTriple;
+          if (!isa<ConstantPointerNull>(SL->getTrueValue()))
+            TrueTriple = TripleMap.at(SL->getTrueValue());
+          else
+            TrueTriple = NullTriple;
+          if (!isa<ConstantPointerNull>(SL->getFalseValue()))
+            FalseTriple = TripleMap.at(SL->getFalseValue());
+          else
+            FalseTriple = NullTriple;
+          auto &Triple = TripleMap[SL];
+          auto *Cond = SL->getCondition();
+          Triple.Base = SelectInst::Create(
+              Cond, TrueTriple.Base, FalseTriple.Base, "base", &*I);
+          Triple.Idx = SelectInst::Create(
+              Cond, TrueTriple.Idx, FalseTriple.Idx, "idx", &*I);
+          Triple.Size = SelectInst::Create(
+              Cond, TrueTriple.Size, FalseTriple.Size, "size", &*I);
+          removeValue(SL);
+        } // end of handling select
 
         if (auto *LI = dyn_cast<LoadInst>(&*I)) {
           DEBUG(errs() << "--- handling load\n");
@@ -1934,7 +1975,7 @@ void LayoutTuner::applyTransformation(
             auto *CalleeN = Mapping.first;
             auto *CallerN = Mapping.second.getNode();
 
-            assert(!SameSCC || Mapping.second.getOffset() == 0);
+            //assert(!SameSCC || Mapping.second.getOffset() == 0);
             DEBUG(errs() << "CALLER N = " << CallerN << '\n');
             auto It = Targets.find(CallerN);
             if (It != Targets.end()) {
@@ -1956,15 +1997,16 @@ void LayoutTuner::applyTransformation(
                          << *CloneFnTy << '\n');
 
             Function *Clone;
+            CloneSignature Sig(TargetsInCallee, CalleeOffsets, getSrcFunc(Callee));
             // maybe we have a clone for this use already
             const auto CloneIt =
-                CloneCache.find({TargetsInCallee, getSrcFunc(Callee)});
+                CloneCache.find(Sig);
             if (CloneIt != CloneCache.end())
               Clone = CloneIt->second;
             else {
               DEBUG(errs() << "--- cloning " << Callee->getName() << '\n');
               Clone = cloneFunctionWithNewType(Callee, CloneFnTy,
-                                               TargetsInCallee, TripleMap);
+                                               TargetsInCallee, TripleMap, Sig);
               DEBUG(errs() << "-- cloned function: " << Clone->getName()
                            << '\n');
               // we haven't processed this new clone
@@ -1978,8 +2020,6 @@ void LayoutTuner::applyTransformation(
             unsigned i = 0;
             for (Value *Arg : CS.args()) {
               if (Targets.count(getNodeForValue(Arg, F).getNode())) {
-                if (!TripleMap.count(Arg))
-                  errs() << "DAFUQ " << *CS.getInstruction() << '\n';
                 DEBUG(errs() << "Looking up triple for " << *Arg << "\n");
                 auto &Triple = TripleMap.at(Arg);
                 assert(Triple.Base);
@@ -2541,7 +2581,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           //
           // make sure no indirect call can access any target
           //
-          if (!CS.getCalledFunction()) {
+          if (!CS.getCalledFunction() || CS.isInvoke()) {
             DenseSet<const DSNode *> ReachableNodes;
             auto *RetN = G->getNodeForValue(CS.getInstruction()).getNode();
             if (RetN)
@@ -2618,15 +2658,6 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
             insertInto(Disqualified, It->second);
         } else if (auto *ITP = dyn_cast<IntToPtrInst>(&I)) {
           auto *N = G->getNodeForValue(ITP).getNode();
-          auto It = Targets.find(N);
-          if (It != Targets.end())
-            insertInto(Disqualified, It->second);
-          if (N)
-            FindTargetsReferred(N, Disqualified);
-        } else if (auto *SL = dyn_cast<SelectInst>(&I)) {
-          // Sigh... This is easy to handle
-          // but I am too lazy and desperate to do it now
-          auto *N = G->getNodeForValue(SL).getNode();
           auto It = Targets.find(N);
           if (It != Targets.end())
             insertInto(Disqualified, It->second);
