@@ -3,6 +3,7 @@
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/Support/raw_ostream.h>
 #include <map>
 #include <memory>
 
@@ -29,6 +30,7 @@ private:
 
 protected:
 public:
+  virtual void dump() const = 0;
   ExprKind getKind() const { return Kind; }
   SymExpr(ExprKind TheKind) : Kind(TheKind) {}
   // lower this expression to LLVM IR
@@ -48,6 +50,9 @@ struct SymConst : public SymExpr {
     auto &Ctx = InsertPt->getContext();
     return ConstantInt::get(Type::getInt64Ty(Ctx), Val);
   }
+  void dump() const override {
+    llvm::errs() << Val;
+  }
 };
 
 struct SymVar : public SymExpr {
@@ -58,6 +63,9 @@ struct SymVar : public SymExpr {
                   llvm::Instruction *InsertPt) override {
     assert(Vars.count(Name) && "undefined variable");
     return Vars.at(Name);
+  }
+  void dump() const override {
+    llvm::errs() << "var(" << Name << ")";
   }
 };
 
@@ -72,6 +80,11 @@ struct SymMod : public SymExpr {
     Value *L = Left->emitCode(Vars, InsertPt),
           *R = Right->emitCode(Vars, InsertPt);
     return BinaryOperator::CreateURem(L, R, "", InsertPt);
+  }
+  void dump() const override {
+    Left->dump();
+    llvm::errs() << "%";
+    Right->dump();
   }
 };
 
@@ -95,6 +108,11 @@ struct SymDiv : public SymExpr {
     }
     return BinaryOperator::CreateUDiv(L, R, "", InsertPt);
   }
+  void dump() const override {
+    Left->dump();
+    llvm::errs() << "/";
+    Right->dump();
+  }
 };
 
 struct SymMul : public SymExpr {
@@ -108,6 +126,11 @@ struct SymMul : public SymExpr {
     Value *L = Left->emitCode(Vars, InsertPt),
           *R = Right->emitCode(Vars, InsertPt);
     return BinaryOperator::CreateNSWMul(L, R, "", InsertPt);
+  }
+  void dump() const override {
+    Left->dump();
+    llvm::errs() << "*";
+    Right->dump();
   }
 };
 
@@ -123,6 +146,13 @@ struct SymAdd : public SymExpr {
           *R = Right->emitCode(Vars, InsertPt);
     return BinaryOperator::CreateNSWAdd(L, R, "", InsertPt);
   }
+  void dump() const override {
+    llvm::errs() << "(";
+    Left->dump();
+    llvm::errs() << "+";
+    Right->dump();
+    llvm::errs() << ")";
+  }
 };
 
 struct SymAnd : public SymExpr {
@@ -136,6 +166,11 @@ struct SymAnd : public SymExpr {
     Value *L = Left->emitCode(Vars, InsertPt),
           *R = Right->emitCode(Vars, InsertPt);
     return BinaryOperator::CreateAnd(L, R, "", InsertPt);
+  }
+  void dump() const override {
+    Left->dump();
+    llvm::errs() << "&";
+    Right->dump();
   }
 };
 

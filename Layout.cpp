@@ -1,8 +1,35 @@
 #include "Layout.h"
 #include "dsa/DSGraph.h"
+#include "llvm/Support/raw_ostream.h"
 #include <memory>
 
 using namespace llvm;
+
+void LayoutDataType::dumpDim() const {
+  for (auto di = Dimensions.rbegin(), de = Dimensions.rend();
+      di != de; ++di) {
+    di->first->dump();
+    errs() << " x ";
+  }
+}
+
+void LayoutScalar::dump() const {
+  dumpDim();
+  errs() << *Ty;
+}
+
+void LayoutStruct::dump() const {
+  dumpDim();
+  errs() << "{ ";
+  for (auto fi = Fields.begin(), fe = Fields.end();
+      fi != fe; ++fi) {
+    errs() << fi->first << ": ";
+    fi->second->dump();
+    if (std::next(fi) != fe)
+      errs() << ", ";
+  }
+  errs() << " }";
+}
 
 //
 // get the number of bytes this type aligned to
@@ -29,6 +56,7 @@ LayoutStruct::LayoutStruct(const LayoutStruct &Src)
     Fields[i].second = LayoutDataType::copy(*Src.Fields[i].second);
   }
   // TODO: reuse calculations from Src
+  assert(isa<LayoutStruct>(this));
   reset();
 }
 
@@ -72,9 +100,11 @@ void LayoutStruct::reset() {
   // if this is an array we also need to align the last element with
   // the first one
   if (!getDims().empty() &&
-      Fields.begin()->second->getAlignedSize(TD) <
-          Fields.rbegin()->second->getAlignedSize(TD))
-    Size = alignTo(Size, getRightmostType(), TD);
+      Fields.rbegin()->second->getAlignedSize(TD) <
+          Fields.begin()->second->getAlignedSize(TD)) {
+    assert(Fields.size() > 1);
+    Size = alignTo(Size, getLeftmostType(), TD);
+  }
 
   SizeForOne = Size;
 }
@@ -105,12 +135,10 @@ LayoutStruct *LayoutStruct::create(const DSNode *Src, const DataLayout *TD,
 }
 
 ExprPtr LayoutDataType::getIdxExpr() const {
-  if (Dimensions.empty())
-    return Const(0);
-
-  ExprPtr Expr = Dimensions[0].second;
-  for (unsigned i = 1; i < Dimensions.size(); i++)
-    Expr = Expr + Dimensions[i - 1].first * Dimensions[i].second;
+  ExprPtr Expr = Const(0);
+  for (auto di = Dimensions.rbegin(), de = Dimensions.rend();
+      di != de; ++di)
+    Expr = Expr * di->first + di->second;
   return Expr;
 }
 
@@ -130,10 +158,13 @@ void LayoutDataType::factorInnermost(ExprPtr Factor) {
 
 std::unique_ptr<LayoutDataType>
 LayoutDataType::copy(const LayoutDataType &Layout) {
+  std::unique_ptr<LayoutDataType> Copy;
   if (isa<LayoutScalar>(&Layout))
-    return make_unique<LayoutScalar>(*cast<LayoutScalar>(&Layout));
-
-  return make_unique<LayoutStruct>(*cast<LayoutStruct>(&Layout));
+    Copy = make_unique<LayoutScalar>(*cast<LayoutScalar>(&Layout));
+  else
+    Copy = make_unique<LayoutStruct>(*cast<LayoutStruct>(&Layout));
+  assert(Copy->getDims().size() == Layout.getDims().size());
+  return Copy;
 }
 
 bool LayoutDataType::hasConstDims() const {

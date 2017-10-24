@@ -17,6 +17,7 @@ namespace llvm {
 typedef std::pair<ExprPtr, ExprPtr> LayoutDimension;
 
 class LayoutDataType {
+protected:
   //
   // Dimensions are ordered from innermost to outermost
   //
@@ -28,9 +29,15 @@ public:
 private:
   DataTypeKind Kind;
 
+protected:
+  void dumpDim() const;
+
 public:
+  virtual void dump() const = 0;
   DataTypeKind getKind() const { return Kind; }
   LayoutDataType(DataTypeKind TheKind) : Kind(TheKind) {}
+  //LayoutDataType(const LayoutDataType &Other)
+  //  : Dimensions(Other.Dimensions), Kind(Other.Kind) {}
   void appendDim(LayoutDimension Dim) { Dimensions.push_back(Dim); }
 
   void prependDim(LayoutDimension Dim) {
@@ -128,6 +135,8 @@ public:
   ExprPtr getSizeForOne(const llvm::DataLayout *TD) const override {
     return Const(TD->getTypeAllocSize(Ty));
   }
+
+  void dump() const override;
 };
 
 class LayoutStruct : public LayoutDataType {
@@ -160,6 +169,8 @@ public:
   // Need to be called after the struct is mutated.
   //
   void reset();
+
+  void dump() const override;
 
   llvm::ArrayRef<Field> getFields() const { return Fields; }
 

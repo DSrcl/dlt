@@ -18,11 +18,13 @@ typedef std::vector<std::pair<unsigned, const LayoutDataType *>> LayoutSet;
 //
 class LayoutState {
   std::shared_ptr<const LayoutDataType> Orig, Cur, Prev;
-  const TransformPool &TP;
+  const TransformPool *TP;
 
 public:
+  //LayoutState(const LayoutState &) = default;
+  //LayoutState &operator=(const LayoutState &) = default;
   LayoutState(std::unique_ptr<const LayoutDataType> OrigLayout,
-                 const TransformPool &TheTP)
+                 const TransformPool *TheTP)
       : Orig(std::move(OrigLayout)), TP(TheTP) {}
   void mutate();
   void revert();
@@ -41,13 +43,32 @@ public:
 //  3) reset -- go back to *original* layout of the target
 class TransformState {
   std::vector<std::pair<unsigned, LayoutState>> States;
-  std::vector<std::pair<unsigned, std::unique_ptr<LayoutDataType>>> Best;
+  std::vector<std::pair<unsigned, std::unique_ptr<const LayoutDataType>>> Best;
   std::vector<bool> Mutated;
   double MutateP;
   double ResetP;
   double BestSoFar;
+  void copy(const TransformState &Other) {
+    Best.clear();
+
+    Mutated = Other.Mutated;
+    States = Other.States;
+    for (auto &GroupAndLayout : Other.Best)
+      Best.emplace_back(GroupAndLayout.first,
+          LayoutDataType::copy(*GroupAndLayout.second));
+    MutateP = Other.MutateP;
+    ResetP = Other.ResetP;
+    BestSoFar = Other.BestSoFar;
+  }
 public:
-  TransformState(LayoutSet &OrigLayouts, const TransformPool &TP,
+  TransformState(const TransformState &Other) {
+    copy(Other);
+  }
+  TransformState &operator=(const TransformState &Other) {
+    copy(Other);
+    return *this;
+  }
+  TransformState(LayoutSet &OrigLayouts, const TransformPool *TP,
       double MutateProb, double ResetProb);
   void mutate();
   // remember the performance of current layout
@@ -57,7 +78,9 @@ public:
   // get current layout
   LayoutSet getLayouts();
   // get the best layout so far
-  LayoutSet getBest();
+  LayoutSet getBest() const;
+  double getBestCost() const { return BestSoFar; }
+  unsigned getNumLayouts() const { return States.size(); }
 };
 
 #endif

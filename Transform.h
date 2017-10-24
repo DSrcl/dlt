@@ -16,7 +16,10 @@ namespace TransformParams {
 class LayoutTransform {
   // randomly walk down the layout to select a sublayout and remember nodes preceding the node selected
   LayoutDataType *select(LayoutDataType *Layout, std::vector<LayoutDataType *> &Parents) const;
+protected:
+  bool WorksOnScalar;
 public:
+  LayoutTransform(bool WorksOnScalar_) : WorksOnScalar(WorksOnScalar_) {}
   virtual void transform(LayoutDataType *) const = 0;
   std::unique_ptr<LayoutDataType> apply(const LayoutDataType &) const;
 };
@@ -43,7 +46,8 @@ class FactorTransform : public LayoutTransform {
   ExprPtr Factor;
 
 public:
-  FactorTransform(unsigned TheFactor) : Factor(Const(TheFactor)) {}
+  FactorTransform(unsigned TheFactor)
+    : LayoutTransform(true), Factor(Const(TheFactor)) {}
   void transform(LayoutDataType *) const override;
 };
 
@@ -53,6 +57,7 @@ public:
 //
 class SOATransform : public LayoutTransform {
 public:
+  SOATransform() : LayoutTransform(false) {}
   void transform(LayoutDataType *) const override;
 };
 
@@ -63,6 +68,7 @@ public:
 //
 class AOSTransform : public LayoutTransform {
 public:
+  AOSTransform() : LayoutTransform(false) {}
   void transform(LayoutDataType *) const override;
 };
 
@@ -72,6 +78,7 @@ public:
 //
 class StructTransform : public LayoutTransform {
 public:
+  StructTransform() : LayoutTransform(false) {}
   void transform(LayoutDataType *) const override;
 };
 
@@ -82,6 +89,7 @@ public:
 //
 class StructFlattenTransform : public LayoutTransform {
 public:
+  StructFlattenTransform() : LayoutTransform(false) {}
   void transform(LayoutDataType *) const override;
 };
 
@@ -90,6 +98,7 @@ public:
 //
 class InterchangeTransform : public LayoutTransform {
 public:
+  InterchangeTransform() : LayoutTransform(true) {}
   void transform(LayoutDataType *) const override;
 };
 
@@ -98,6 +107,7 @@ public:
 //
 class SwapTransform : public LayoutTransform {
 public:
+  SwapTransform() : LayoutTransform(false) {}
   void transform(LayoutDataType *) const override;
 };
 

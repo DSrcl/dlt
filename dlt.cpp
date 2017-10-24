@@ -5,11 +5,11 @@
 #include "dsa/DataStructure.h"
 #include "dsa/InitializeDSAPasses.h"
 #include "dsa/TypeSafety.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Bitcode/BitcodeWriterPass.h"
-#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -37,13 +37,14 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 
 #include <limits>
-#include <unistd.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #define DEBUG_TYPE "dlt"
 
 //
 // ========== RAAAAAAAAAAAAAAAAAAAAAAAAAMBLING ==========
+// 0) support use of pthread_create where callee is staically known
 // 1) Support use of memcpy that copies constant number of bytes and
 // the bytes equals nodes we are transforming
 // 2) When getting new type for GEP, relying on the input type is wrong.
@@ -75,9 +76,23 @@ cl::opt<unsigned>
     MinSize("min-size", cl::desc("Minimum size of an object to be transformed"),
             cl::init(4));
 
+cl::opt<unsigned>
+    MinFields("min-fields",
+              cl::desc("Minimum number of fields an object to be transformed"),
+              cl::init(2));
+
 cl::list<std::string>
     TestArgv(cl::ConsumeAfter,
              cl::desc("<program arguments to test compiled module>"));
+
+cl::opt<bool> ArrayOnly("array-only",
+                        cl::desc("Only tune objects that are arrays"));
+
+cl::opt<bool> NoPointer("no-pointer",
+                        cl::desc("Don't tune objects that contains pointer field(s)"));
+
+cl::opt<bool> NoFP("no-fp",
+    cl::desc("Don't tune objects with function pointers"));
 
 cl::opt<double> ResetProb(
     "reset-prob",
@@ -94,9 +109,15 @@ cl::opt<unsigned>
     Iterations("iters", cl::desc("Number of iterations to run the tuner with"),
                cl::init(4));
 
+cl::opt<bool> Dump("dump", cl::desc("Dump modules"), cl::init(false));
+
+cl::opt<double> TMax("tmax", cl::desc("Max temperature"), cl::init(0.01));
+
+cl::opt<double> TMin("tmin", cl::desc("Min temperature"), cl::init(0.0001));
+
 double randProb() {
   static std::default_random_engine Ngn;
-  static std::uniform_real_distribution<double> Dist(0.0,1.0);
+  static std::uniform_real_distribution<double> Dist(0.0, 1.0);
   return Dist(Ngn);
 }
 
@@ -145,17 +166,21 @@ std::unique_ptr<LayoutDataType> swapFields(const LayoutDataType &Layout) {
 }
 
 class TransformLowering {
+private:
+  const DSNode *Target;
+
 protected:
   StructType *TargetTy;
   Constant *ElemSize;
   unsigned Size;
   std::map<unsigned, unsigned> Offset2IdxMap;
 
-  TransformLowering(const DSNode *Target);
+  TransformLowering(const DSNode *TheTarget);
 
 public:
   Constant *getOrigSize() const { return ElemSize; }
   unsigned getSize() const { return Size; }
+  const DSNode *getTarget() { return Target; }
 
   // compute the address of an element after transformation
   virtual Value *ComputeAddress(IndexTriple Triple, unsigned Offset,
@@ -218,8 +243,9 @@ class CloneSignature {
   Function *Src;
 
 public:
-  CloneSignature(TargetMapTy TheTargets, OffsetMapTy TheOffsets, Function *TheSrc)
-  : Src(TheSrc) {
+  CloneSignature(TargetMapTy TheTargets, OffsetMapTy TheOffsets,
+                 Function *TheSrc)
+      : Src(TheSrc) {
     for (auto TargetAndGroup : TheTargets)
       Targets.push_back(TargetAndGroup);
     for (auto TargetAndOffset : TheOffsets)
@@ -227,7 +253,8 @@ public:
   }
 
   bool operator<(const CloneSignature &Other) const {
-    return std::tie(Targets, Offsets, Src) < std::tie(Other.Targets, Other.Offsets, Other.Src);
+    return std::tie(Targets, Offsets, Src) <
+           std::tie(Other.Targets, Other.Offsets, Other.Src);
   }
 };
 
@@ -268,8 +295,7 @@ class LayoutTuner : public ModulePass {
   // from foo to make_vec.
   class RefRecord {
     const DSNode *OrigN;
-    // offset to OrigN
-    unsigned Offset;
+    unsigned OffsetToOrig;
 
     // offsets in a DSNode that could point to a target
     std::set<unsigned> References;
@@ -289,16 +315,16 @@ class LayoutTuner : public ModulePass {
     // remember the fact that N points to a subset of nodes in Targets
     //
     template <typename NODE_SET_TY>
-    RefRecord(const DSNode *N, const NODE_SET_TY &Targets) : OrigN(N) {
-      for (auto fi = N->type_begin(), fe = N->type_end(); fi != fe; ++fi) {
-        unsigned Offset = fi->first;
-        if (N->hasLink(Offset) && Targets.count(N->getLink(Offset).getNode()))
-          References.insert(Offset);
+    RefRecord(const DSNode *N, const NODE_SET_TY &Targets)
+        : OrigN(N), OffsetToOrig(0) {
+      for (auto ei = N->edge_begin(), ee = N->edge_end(); ei != ee; ++ei) {
+        if (Targets.count(ei->second.getNode()))
+          References.insert(ei->first);
       }
     }
 
     const DSNode *getOrigNode() const { return OrigN; }
-    unsigned getOffsetToOrigNode() const { return Offset; }
+    unsigned getOffsetToOrigNode() const { return OffsetToOrig; }
 
     //
     // remember the fact that CallerNH points to a set of targets
@@ -306,13 +332,13 @@ class LayoutTuner : public ModulePass {
     //
     RefRecord(DSNodeHandle CallerNH, const DSNode *CalleeN,
               const RefRecord &CallerRefs)
-        : OrigN(CallerRefs.OrigN) {
+        : OrigN(CallerRefs.OrigN),
+          OffsetToOrig(CallerRefs.OffsetToOrig + CallerNH.getOffset()) {
       unsigned Offset = CallerNH.getOffset();
       for (unsigned RefOffset : CallerRefs.References) {
         if (RefOffset < Offset)
           continue;
-        if (RefOffset - Offset < CalleeN->getSize())
-          References.insert(RefOffset - Offset);
+        References.insert(RefOffset - Offset);
       }
     }
   };
@@ -342,7 +368,7 @@ class LayoutTuner : public ModulePass {
     getCalleeTracker(const NODE_SET_TY &TargetsInCallee,
                      const DSGraph::NodeMapTy &CalleeCallerMapping) const {
       RefSetTracker CalleeTracker(TargetsInCallee);
-      DEBUG(errs() << "SIZE OF TARGETS: " << TargetsInCallee.size() << '\n');
+      DEBUG(errs() << "SIZE OF TARGETS: " << Targets.size() << '\n');
 
       const DSNode *CalleeN;
       DSNodeHandle CallerNH;
@@ -357,6 +383,8 @@ class LayoutTuner : public ModulePass {
               RefRecord(CallerNH, CalleeN, CallerRefRecord);
         } else if (auto Ref = RefRecord(CallerN, Targets)) {
           CalleeTracker.RefRecords[CalleeN] = RefRecord(CallerNH, CalleeN, Ref);
+          assert(CalleeTracker.RefRecords.at(CalleeN).getOrigNode() ==
+                 CallerNH.getNode());
         }
       }
 
@@ -380,7 +408,8 @@ class LayoutTuner : public ModulePass {
     }
 
     bool hasRefAt(const DSNode *N, unsigned Offset) const {
-      if (N->hasLink(Offset) && Targets.count(N->getLink(Offset).getNode()))
+      if (Offset < N->getSize() && N->hasLink(Offset) &&
+          Targets.count(N->getLink(Offset).getNode()))
         return true;
 
       auto It = RefRecords.find(N);
@@ -391,6 +420,9 @@ class LayoutTuner : public ModulePass {
     }
 
     bool refersTargets(const DSNode *N) const {
+      if (!N)
+        return false;
+
       if (RefRecords.count(N))
         return true;
 
@@ -411,6 +443,9 @@ class LayoutTuner : public ModulePass {
 
   // we can reuse a clone if they have the same parent and same type
   std::map<CloneSignature, Function *> CloneCache;
+
+  // reallocs for different targets
+  std::map<const DSNode *, Function *> Reallocs;
 
   Type *VoidTy, *Int8Ty, *Int32Ty, *Int64Ty;
   StructType *TripleTy;
@@ -499,12 +534,13 @@ class LayoutTuner : public ModulePass {
   Constant *getNewInitializer(Constant *Init, const DSNode *N, unsigned Offset,
                               const NODE_SET_TY &Targets);
 
-  FunctionType *computeCloneFnTy(CallSite CS,
+  FunctionType *computeCloneFnTy(Function *,
                                  const RefSetTracker<TargetMapTy> &);
-  Function *cloneFunctionWithNewType(Function *Src, FunctionType *FnTy,
-                                     const TargetMapTy &Targets,
-                                     std::map<Value *, IndexTriple> &TripleMap,
-                                     CloneSignature &Sig);
+  Function *cloneFunction(Function *Src, FunctionType *FnTy,
+                          const TargetMapTy &Targets,
+                          std::map<Value *, IndexTriple> &TripleMap,
+                          CloneSignature &Sig, bool ReturnsTarget);
+  Function *getRealloc(TransformLowering *, Module *);
   std::vector<DSGraph *> SortedSCCs;
   std::map<DSGraph *, unsigned> SCCToOrderMap;
   std::map<DSGraph *, std::vector<CallEdgeTy>> OutgoingEdges;
@@ -541,12 +577,14 @@ class LayoutTuner : public ModulePass {
                       Instruction *InsertPt, const Twine &Name);
 
   template <typename NODE_SET_TY>
-  StructType *computeTypeWithTripleConv(const DSNode *N,
-                                        const NODE_SET_TY &Targets) const;
+  StructType *
+  computeTypeWithTripleConv(const DSNode *N,
+                            const RefSetTracker<NODE_SET_TY> &Refs) const;
 
   template <typename NODE_SET_TY>
-  unsigned computeSizeWithTripleConv(const DSNode *N,
-                                     const NODE_SET_TY &Targets) const;
+  unsigned
+  computeSizeWithTripleConv(const DSNode *N,
+                            const RefSetTracker<NODE_SET_TY> &Refs) const;
 
   //
   // returns if N points a any one of targets *directly*
@@ -633,13 +671,15 @@ char LayoutTuner::ID = 42;
 // define 'initializeLayoutTunerPass()'
 INITIALIZE_PASS_BEGIN(LayoutTuner, "", "", true, true)
 initializeTypeSafetyEquivBU(Registry);
+initializeTypeSafetyEQTD(Registry);
 INITIALIZE_PASS_DEPENDENCY(EquivBUDataStructures)
 INITIALIZE_PASS_DEPENDENCY(AllocIdentify)
 INITIALIZE_PASS_END(LayoutTuner, "", "", true, true)
 
 // FIXME this doens't work for fields with union type
 // need to get the largest type in this case
-TransformLowering::TransformLowering(const DSNode *Target) {
+TransformLowering::TransformLowering(const DSNode *TheTarget)
+    : Target(TheTarget) {
   std::vector<Type *> Fields;
   unsigned i = 0;
   DEBUG(errs() << "TARGET FIELDS:\n");
@@ -654,7 +694,8 @@ TransformLowering::TransformLowering(const DSNode *Target) {
   TargetTy = StructType::get(Ctx, Fields);
   Size = Target->getSize();
   ElemSize = ConstantInt::get(Type::getInt64Ty(Ctx), Target->getSize());
-  DEBUG(errs() << "TARGET TYPE: " << *TargetTy << '\n');
+  DEBUG(errs() << "TARGET TYPE: " << *TargetTy
+               << " ORIG TARGET SIZE: " << Target->getSize() << '\n');
 }
 
 Value *NoopTransform::ComputeAddress(IndexTriple Triple, unsigned Offset,
@@ -813,6 +854,9 @@ Value *LayoutTuner::rewriteAlloc(CallSite OldAlloc, Value *SizeInBytes,
   if (Allocator->getName() == "calloc")
     // fucking bullshit
     AllocArgs = {One64, SizeInBytes};
+  else if (Allocator->getName() == "realloc")
+    // yet another fucking bullshit
+    AllocArgs = {OldAlloc.getArgOperand(0), SizeInBytes};
   else
     AllocArgs = {SizeInBytes};
 
@@ -834,14 +878,14 @@ Value *LayoutTuner::rewriteAlloc(CallSite OldAlloc, Value *SizeInBytes,
 // packed struct
 //
 template <typename NODE_SET_TY>
-StructType *
-LayoutTuner::computeTypeWithTripleConv(const DSNode *N,
-                                       const NODE_SET_TY &Targets) const {
+StructType *LayoutTuner::computeTypeWithTripleConv(
+    const DSNode *N, const RefSetTracker<NODE_SET_TY> &Refs) const {
   std::vector<Type *> Elems;
-  for (auto ti = N->type_begin(), te = N->type_end(); ti != te; ++ti) {
+  auto *OrigN = Refs.getOrigNode(N);
+  for (auto ti = OrigN->type_begin(), te = OrigN->type_end(); ti != te; ++ti) {
     unsigned Offset = ti->first;
     Type *ET = *ti->second->begin();
-    if (N->hasLink(Offset) && Targets.count(N->getLink(Offset).getNode()))
+    if (Refs.hasRefAt(N, Offset))
       Elems.push_back(TripleTy);
     else
       Elems.push_back(ET);
@@ -855,21 +899,89 @@ LayoutTuner::computeTypeWithTripleConv(const DSNode *N,
 //
 //
 template <typename NODE_SET_TY>
-unsigned
-LayoutTuner::computeSizeWithTripleConv(const DSNode *N,
-                                       const NODE_SET_TY &Targets) const {
+unsigned LayoutTuner::computeSizeWithTripleConv(
+    const DSNode *N, const RefSetTracker<NODE_SET_TY> &Refs) const {
 
-  auto *ConvertedType = computeTypeWithTripleConv(N, Targets);
+  auto *ConvertedType = computeTypeWithTripleConv(N, Refs);
   return TD->getTypeAllocSize(ConvertedType);
+}
+
+Function *LayoutTuner::getRealloc(TransformLowering *Transform, Module *M) {
+  const DSNode *N = Transform->getTarget();
+
+  auto ReallocIt = Reallocs.find(N);
+  if (ReallocIt != Reallocs.end())
+    return ReallocIt->second;
+
+  auto *ReallocTy = FunctionType::get(
+      Int8PtrTy, std::vector<Type *>{Int8PtrTy, Int64Ty, Int64Ty},
+      false /*varags*/);
+  auto *Realloc = Function::Create(ReallocTy, Function::InternalLinkage,
+                                   "specialized_realloc", M);
+  Realloc->addFnAttr(Attribute::NoInline);
+
+  Constant *Zero = ConstantInt::get(Int64Ty, 0),
+           *One = ConstantInt::get(Int64Ty, 1);
+
+  Reallocs[N] = Realloc;
+  Value *Old = &*Realloc->arg_begin(),
+        *NewSize = &*std::next(Realloc->arg_begin()),
+        *OldSize = &*std::next(Realloc->arg_begin(), 2);
+  auto &Ctx = Realloc->getContext();
+
+  auto *Entry = BasicBlock::Create(Ctx, "entry", Realloc);
+  auto *Ret = BasicBlock::Create(Ctx, "ret", Realloc);
+  auto *LoopCond = BasicBlock::Create(Ctx, "loop.cond", Realloc);
+  auto *LoopBody = BasicBlock::Create(Ctx, "loop.body", Realloc);
+
+  auto *Noop = new AllocaInst(Int8Ty, "", Entry);
+  auto *Bytes = Transform->ComputeBytesToAlloc(NewSize, Noop);
+  auto *IntPtrTy = TD->getIntPtrType(Int8PtrTy);
+  auto *New =
+      CallInst::CreateMalloc(Noop, IntPtrTy, Int8Ty, One, Bytes, nullptr, "");
+  auto *Null = ConstantPointerNull::get(Int8PtrTy);
+  auto *IsNull = new ICmpInst(*Entry, ICmpInst::ICMP_EQ, Old, Null);
+  // if the object being realloc'd is null, we don't need to copy anything
+  BranchInst::Create(Ret /*true*/, LoopCond /*false*/, IsNull /*cond*/, Entry);
+
+  // free old obj and return
+  auto *RetI = ReturnInst::Create(Ctx, New, Ret);
+  CallInst::CreateFree(Old, RetI);
+
+  // loop over Old and copy things to New
+  auto *Idx = PHINode::Create(Int64Ty, 2, "i", LoopCond);
+  auto *NewIsGreater = new ICmpInst(*LoopCond, ICmpInst::ICMP_UGE, NewSize, OldSize);
+  auto *SizeToCopy = SelectInst::Create(NewIsGreater, OldSize, NewSize, "", LoopCond);
+  auto *LessThanSize =
+      new ICmpInst(*LoopCond, ICmpInst::ICMP_UGE, Idx, SizeToCopy);
+  BranchInst::Create(Ret /*true*/, LoopBody /*false*/, LessThanSize /*cond*/,
+                     LoopCond);
+
+  auto *IdxInc = BinaryOperator::CreateNSWAdd(Idx, One, "i.inc", LoopBody);
+  auto *Continue = BranchInst::Create(LoopCond /*true*/, LoopBody);
+  Idx->addIncoming(Zero, Entry);
+  Idx->addIncoming(IdxInc, LoopBody);
+  // loop over each offset and do copying
+  for (auto fi = N->type_begin(), fe = N->type_end(); fi != fe; ++fi) {
+    unsigned Offset = fi->first;
+    auto *OldAddr = Transform->ComputeAddress({Old, Idx, OldSize}, Offset,
+                                              Continue /*insert pt*/);
+    auto *OldValue = new LoadInst(OldAddr, "old.val", Continue);
+    auto *NewAddr =
+        Transform->ComputeAddress({New, Idx, NewSize}, Offset, Continue);
+    new StoreInst(OldValue, NewAddr, Continue);
+  }
+
+  return Realloc;
 }
 
 //
 // clone a function and change it to use arguments properly
 //
-Function *LayoutTuner::cloneFunctionWithNewType(
-    Function *Src, FunctionType *FnTy, const TargetMapTy &Targets,
-    std::map<Value *, IndexTriple> &TripleMap,
-    CloneSignature &Sig) {
+Function *LayoutTuner::cloneFunction(Function *Src, FunctionType *FnTy,
+                                     const TargetMapTy &Targets,
+                                     std::map<Value *, IndexTriple> &TripleMap,
+                                     CloneSignature &Sig, bool ReturnsTarget) {
   ValueToValueMapTy ValueMap;
   auto *Clone = CloneFunction(Src, ValueMap);
   Clone->setVisibility(Function::DefaultVisibility);
@@ -901,16 +1013,17 @@ Function *LayoutTuner::cloneFunctionWithNewType(
 
   // TODO: clone attributes from the clone
   Clone->getParent()->getFunctionList().insert(Clone->getIterator(), NewF);
-  NewF->takeName(Clone);
+  NewF->setName("CLONED." + Clone->getName());
   NewF->getBasicBlockList().splice(NewF->begin(), Clone->getBasicBlockList());
 
   if (Src->hasPersonalityFn())
     NewF->setPersonalityFn(Src->getPersonalityFn());
 
   // transfer arguments from Clone to NewF
-  for (auto I = Clone->arg_begin(), E = Clone->arg_end(),
-            I2 = NewF->arg_begin();
-       I != E; ++I, ++I2) {
+  auto I2 = NewF->arg_begin();
+  if (ReturnsTarget)
+    I2 = std::next(I2, 3);
+  for (auto I = Clone->arg_begin(), E = Clone->arg_end(); I != E; ++I, ++I2) {
     auto *N = getNodeForValue(&*I, NewF).getNode();
     if (Targets.count(N)) {
       // pointer to target has been expanded into triple
@@ -941,19 +1054,15 @@ Function *LayoutTuner::cloneFunctionWithNewType(
 // TODO: support c++ allocators
 bool LayoutTuner::isAllocator(const Function *F) {
   StringRef Name = F->getName();
-  return Name == "malloc" || Name == "calloc" ||
-    Name == "_Znwm" ||
-    Name == "_Znam" ||
-    Name == "_Znwj" ||
-    Name == "_Znaj";
+  return Name == "malloc" || Name == "calloc" || Name == "_Znwm" ||
+         Name == "_Znam" || Name == "_Znwj" || Name == "_Znaj" ||
+         Name == "realloc";
 }
 
 // TODO: support c++ deallocators
 bool LayoutTuner::isDeallocator(const Function *F) {
   StringRef Name = F->getName();
-  return Name == "free" ||
-    Name == "_ZdlPv" ||
-    Name == "_ZdaPv";
+  return Name == "free" || Name == "_ZdlPv" || Name == "_ZdaPv";
 }
 
 bool LayoutTuner::runOnModule(Module &M) {
@@ -990,16 +1099,13 @@ bool LayoutTuner::runOnModule(Module &M) {
   TargetMapTy TargetsInGG;
 
   TransformPool TP;
-  TP.addTransform(make_unique<FactorTransform>(4), 0.05);
-  TP.addTransform(make_unique<FactorTransform>(8), 0.05);
-  TP.addTransform(make_unique<FactorTransform>(16), 0.05);
-  TP.addTransform(make_unique<FactorTransform>(32), 0.05);      // 0.2
-  TP.addTransform(make_unique<StructTransform>(), 0.15);        // 0.35
-  TP.addTransform(make_unique<StructFlattenTransform>(), 0.15); // 0.5
-  TP.addTransform(make_unique<SOATransform>(), 0.15);           // 0.65
-  TP.addTransform(make_unique<AOSTransform>(), 0.15);           // 0.8
-  TP.addTransform(make_unique<SwapTransform>(), 0.05);          // 0.85
-  TP.addTransform(make_unique<InterchangeTransform>(), 0.05);   // 0.85
+  TP.addTransform(make_unique<FactorTransform>(4), 0.05);      
+  TP.addTransform(make_unique<StructTransform>(), 0.05);        // 0.1
+  TP.addTransform(make_unique<StructFlattenTransform>(), 0.05); // 0.15
+  TP.addTransform(make_unique<SOATransform>(), 0.3);            // 0.45
+  TP.addTransform(make_unique<AOSTransform>(), 0.3);            // 0.75
+  TP.addTransform(make_unique<SwapTransform>(), 0.2);           // 0.95
+  TP.addTransform(make_unique<InterchangeTransform>(), 0.05);   // 1.00
 
   unsigned i = 0;
   auto *GG = DSA->getGlobalsGraph();
@@ -1032,19 +1138,13 @@ bool LayoutTuner::runOnModule(Module &M) {
     }
   };
 
-  TransformState State(OrigLayouts, TP, MutateProb, ResetProb);
+  TransformState State(OrigLayouts, &TP, MutateProb, ResetProb);
   double CurCost = std::numeric_limits<double>::max();
-  double TMin = 0.001, TMax = 0.05,
-         T = TMax, Alpha = std::pow(TMin/TMax, 1.0/double(Iterations));
+  double T = TMax, Alpha = std::pow(TMin / TMax, 1.0 / double(Iterations));
   errs() << "T = " << T << ", ALPHA = " << Alpha << '\n';
   for (int i = 0; i < Iterations; i++) {
     setTransforms(State.getLayouts());
-#if 0
-    applyTransformation(M, Targets, TargetsInGG, Transforms);
-    break;
-#endif
 
-#if 1
     // set up a pipe for the child process to report back
     // performance of the transformed code
     int Pipe[2], &PipeIn = Pipe[0], &PipeOut = Pipe[1];
@@ -1063,6 +1163,7 @@ bool LayoutTuner::runOnModule(Module &M) {
       cleanupDeadValues();
       double Cost = evaluate(M, TestArgv);
       ssize_t BytesWritten = write(PipeOut, &Cost, sizeof Cost);
+      close(PipeOut);
       if (BytesWritten < 0) {
         errs() << "Failed to write to pipe\n";
         exit(1);
@@ -1075,23 +1176,30 @@ bool LayoutTuner::runOnModule(Module &M) {
       double Cost;
       close(PipeOut);
       ssize_t BytesRead = read(PipeIn, &Cost, sizeof Cost);
+      close(PipeIn);
       int Stat;
       waitpid(Child, &Stat, 0);
       if (BytesRead < 0) {
         errs() << "Failed to read from pipe\n";
         exit(1);
-      } else if (BytesRead != sizeof Cost) {
+      } else if (BytesRead == sizeof Cost && Cost > 0) {
+        State.setCost(Cost);
+      } else {
         errs() << "Failed to evaluate layout\n";
-        State.revert();
-        State.mutate();
-        continue;
+        for (auto &GroupAndLayout : State.getLayouts()) {
+          errs() << "LAYOUT DUMP, Group = " << GroupAndLayout.first << ": ";
+          GroupAndLayout.second->dump();
+          errs() << '\n';
+        }
       }
-      State.setCost(Cost);
-      double AcceptProb = std::min<double>(std::exp((CurCost-Cost)/T), 1),
+
+      double AcceptProb =
+                 (BytesRead == sizeof Cost && Cost > 0
+                      ? std::min<double>(std::exp((CurCost - Cost) / T), 1)
+                      : 0),
              P = randProb();
       errs() << "new = " << Cost << ", cur = " << CurCost
-        << ", accept prob = " << AcceptProb
-        << ", p = " << P << '\n';
+             << ", accept prob = " << AcceptProb << ", p = " << P << '\n';
       bool Accept = P < AcceptProb;
       if (!Accept)
         State.revert();
@@ -1101,12 +1209,19 @@ bool LayoutTuner::runOnModule(Module &M) {
     }
 
     State.mutate();
-#endif
+
     T *= Alpha;
   }
 
   setTransforms(State.getBest());
+  for (auto &GroupAndLayout : State.getBest()) {
+    errs() << "Layout (" << GroupAndLayout.first << "): ";
+    GroupAndLayout.second->dump();
+    errs() << '\n';
+  }
   applyTransformation(M, Targets, TargetsInGG, Transforms);
+  if (Dump)
+    M.dump();
   cleanupDeadValues();
   CalleeCallerMappings.clear();
   GToGGMappings.clear();
@@ -1208,16 +1323,13 @@ Type *LayoutTuner::getNewType(const DSNode *N,
       }
 
       Type *NewET;
-      if (Refs.hasRefAt(N, ElementOffset))
-        NewET = TripleTy;
-      else if (N->hasLink(ElementOffset)) {
-        auto &Edge = N->getLink(ElementOffset);
-        if (Refs.getTargets().count(Edge.getNode()))
-          NewET = getNewType(Edge.getNode(), Refs, ET, Edge.getOffset());
+      if (ET->isPointerTy()) {
+        if (Refs.hasRefAt(N, ElementOffset))
+          NewET = TripleTy;
         else
           NewET = ET;
       } else
-        NewET = ET;
+        NewET = getNewType(N, Refs, ET, ElementOffset);
 
       Elements.push_back(NewET);
     }
@@ -1260,8 +1372,7 @@ Type *LayoutTuner::getNewType(Value *V, DSNodeHandle NH,
   unsigned Offset = NH.getOffset();
   auto *N = NH.getNode();
 
-  return getNewType(Refs.getOrigNode(N), Refs, getOrigType(V),
-                    Refs.getOffsetToOrigNode(N) + Offset);
+  return getNewType(N, Refs, getOrigType(V), Offset);
 }
 
 //
@@ -1428,7 +1539,7 @@ LayoutTuner::getCalleeCallerMapping(LayoutTuner::CallEdgeTy Edge) {
 
   bool Strict = CS.getCalledFunction() != nullptr;
   G->computeCalleeCallerMapping(DSCS, *Callee, *CalleeG, CalleeCallerMapping,
-                                Strict);
+                                false);
 
   return CalleeCallerMapping;
 }
@@ -1436,13 +1547,7 @@ LayoutTuner::getCalleeCallerMapping(LayoutTuner::CallEdgeTy Edge) {
 //
 // i am too lazy to support these now
 //
-static bool isUnsupportedLibCall(const Function *F) {
-  auto IID = F->getIntrinsicID();
-  return IID == Intrinsic::memcpy || IID == Intrinsic::memmove ||
-         IID == Intrinsic::memset || F->getName() == "realloc";
-}
-
-// TODO: handle memcpy, memmove, and memset
+// TODO: handle memmove, and memset
 // TODO: try *really hard* to think about why the way we processing function
 // works (I think?)
 // TODO: emit alias.scope metadata for transformed loads/stores.
@@ -1600,14 +1705,20 @@ void LayoutTuner::applyTransformation(
             DEBUG(errs() << "--- updating idx\n");
             // Src is Target
             // we postpone the actual address calculation by updating the triple
-            assert(TripleMap.count(Src));
-            IndexTriple &OldTriple = TripleMap.at(Src);
+            assert(isa<ConstantPointerNull>(Src) || TripleMap.count(Src));
+            IndexTriple OldTriple;
+            if (!isa<ConstantPointerNull>(Src))
+              OldTriple = TripleMap.at(Src);
+            else
+              OldTriple = NullTriple;
             IndexTriple &NewTriple = TripleMap[GEP] = OldTriple;
             Instruction *InsertPt = &*std::next(I);
 
             unsigned GroupId = Targets.lookup(N);
+
             // Update Idx
-            if (TD->getTypeAllocSize(OrigSrcTy) == Transforms.at(GroupId)->getSize()) {
+            if (TD->getTypeAllocSize(OrigSrcTy) ==
+                Transforms.at(GroupId)->getSize()) {
               // FIXME this is broken
               // -- consider this example `gep {[1 x i32]}`
               // This should be fixed fairly easily by implementing something
@@ -1617,7 +1728,7 @@ void LayoutTuner::applyTransformation(
               // and divide it by size of the target
               auto *Diff = GEP->idx_begin()->get();
               if (Diff->getType() != Int64Ty)
-                Diff = new ZExtInst(Diff, Int64Ty, "", InsertPt);
+                Diff = new SExtInst(Diff, Int64Ty, "", InsertPt);
               NewTriple.Idx = BinaryOperator::CreateNSWAdd(
                   OldTriple.Idx, Diff, "updated_idx", InsertPt);
             } else {
@@ -1634,13 +1745,13 @@ void LayoutTuner::applyTransformation(
                            RelOffset + Offsets.lookup(SrcNH.getNode()) +
                                SrcNH.getOffset());
               auto *Diff = BinaryOperator::CreateUDiv(AbsOffset, TargetSize, "",
-                                                      InsertPt);
+                                                     InsertPt);
               NewTriple.Idx = BinaryOperator::CreateNSWAdd(
                   OldTriple.Idx, Diff, "updated_idx", InsertPt);
             }
 
             removeValue(GEP);
-          } else if (Src->getType() != SrcTy) {
+          } else if (Src->getType() != SrcTy || Refs.refersTargets(N)) {
             auto *SrcFixed =
                 CastInst::CreatePointerCast(Src, SrcTy, "cast4gep", GEP);
             std::vector<Value *> Idxs(GEP->idx_begin(), GEP->idx_end());
@@ -1652,8 +1763,9 @@ void LayoutTuner::applyTransformation(
                 cast<PointerType>(ResultTy)->getElementType());
             updateValue(Src, SrcFixed);
             GEP->getOperandUse(0).set(SrcFixed);
-            GEP->mutateType(ResultTy);
+            updateType(GEP, ResultTy);
           }
+
         } // end of handling GEP
 
         auto *SL = dyn_cast<SelectInst>(&*I);
@@ -1670,18 +1782,20 @@ void LayoutTuner::applyTransformation(
             FalseTriple = NullTriple;
           auto &Triple = TripleMap[SL];
           auto *Cond = SL->getCondition();
-          Triple.Base = SelectInst::Create(
-              Cond, TrueTriple.Base, FalseTriple.Base, "base", &*I);
-          Triple.Idx = SelectInst::Create(
-              Cond, TrueTriple.Idx, FalseTriple.Idx, "idx", &*I);
-          Triple.Size = SelectInst::Create(
-              Cond, TrueTriple.Size, FalseTriple.Size, "size", &*I);
+          Triple.Base = SelectInst::Create(Cond, TrueTriple.Base,
+                                           FalseTriple.Base, "base", &*I);
+          Triple.Idx = SelectInst::Create(Cond, TrueTriple.Idx, FalseTriple.Idx,
+                                          "idx", &*I);
+          Triple.Size = SelectInst::Create(Cond, TrueTriple.Size,
+                                           FalseTriple.Size, "size", &*I);
           removeValue(SL);
         } // end of handling select
 
         if (auto *LI = dyn_cast<LoadInst>(&*I)) {
           DEBUG(errs() << "--- handling load\n");
           if (Targets.count(N)) {
+            auto SrcNH = getNodeForValue(LI->getPointerOperand(), F);
+            assert(Refs.hasRefAt(SrcNH.getNode(), SrcNH.getOffset()));
             DEBUG(errs() << "--- loading triple-converted pointer\n");
             // case 1: loading pointer to Target
             // instead of loading the pointer, we load the triple
@@ -1774,7 +1888,6 @@ void LayoutTuner::applyTransformation(
             // 3) storing to a pointer of target but the the value
             // being stored is not target itself. In this case we have to assume
             // it's a null being stored
-            DEBUG(errs() << "SIGH " << *Src << ", " << SrcN << '\n');
             assert(isa<ConstantPointerNull>(Src) && "WTF");
             auto *TriplePtr =
                 CastInst::CreatePointerCast(Dest, TriplePtrTy, "", &*I);
@@ -1785,6 +1898,26 @@ void LayoutTuner::applyTransformation(
             removeValue(&*I);
           } else {
             auto *DestTy = cast<PointerType>(Dest->getType())->getElementType();
+            //if (!DestN)  {
+            //  const DSNode *X  = DSA->getGlobalsGraph()->getNodeForValue(getOrigValue(Dest)).getNode(),
+            //        *Y = nullptr;
+            //  auto &GToGGMapping = getGToGGMapping(getDSGraph(F));
+            //  for (auto &Mapping : GToGGMapping)
+            //    if (Mapping.second.getNode() == X) {
+            //      Y = Mapping.first;
+            //      break;
+            //    }
+            //  errs() << "[BS2] casting " << *Src << " -> " << *DestTy
+            //    << "\n\t DestN: " << DestN
+            //    << "\n\t storing to ref?: " << (DestN && Refs.hasRefAt(DestN, DestNH.getOffset()))
+            //    << "\n\t DEST = " << *Dest
+            //    << "\n\t OrigDest: " << *getOrigValue(Dest)
+            //    << "\n\t F cloned?: " << CloneRecords.count(F)
+            //    << "\n\t F = "  << F->getName()
+            //    << "\n\t WTF = " << X
+            //    << "\n\t MAYBE = " << Y
+            //    << "\n";
+            //}
             if (Src->getType() != DestTy) {
               auto *SrcFixed = CastInst::CreatePointerCast(Src, DestTy, "", SI);
               SI->getOperandUse(0).set(SrcFixed);
@@ -1800,9 +1933,9 @@ void LayoutTuner::applyTransformation(
               updateType(PN, NewType);
               for (unsigned i = 0; i < PN->getNumIncomingValues(); i++) {
                 auto *Incoming = PN->getIncomingValue(i);
-                if (isa<UndefValue>(Incoming))
-                  Incoming->mutateType(NewType);
-                else if (Incoming->getType() != NewType) {
+                if (isa<UndefValue>(Incoming)) {
+                  updateType(Incoming, NewType);
+                } else if (Incoming->getType() != NewType) {
                   auto *IncomingBB = PN->getIncomingBlock(i);
                   auto *IncomingFixed = CastInst::CreatePointerCast(
                       Incoming, NewType, "", IncomingBB->getTerminator());
@@ -1881,21 +2014,30 @@ void LayoutTuner::applyTransformation(
         } // end of handling bitcast
 
         if (auto CS = CallSite(&*I)) {
+          DEBUG(errs() << "!!! handling call\n");
           // don't support indirect call
           if (!CS.getCalledFunction())
             continue;
 
           Function *Callee = CS.getCalledFunction();
+          if (Callee->getIntrinsicID() == Intrinsic::lifetime_start ||
+              Callee->getIntrinsicID() == Intrinsic::lifetime_end) {
+            auto *Ptr = I->getOperand(1);
+            if (Targets.count(getNodeForValue(Ptr, F).getNode()))
+              I->getOperandUse(1).set(TripleMap.at(Ptr).Base);
+          }
           // rewrite the allocation
           if (isAllocator(Callee)) {
             DEBUG(errs() << "ALLOCATOR: " << Callee->getName() << '\n');
             assert(CS.getNumArgOperands() == 1 ||
-                   Callee->getName() == "calloc" && "Unknown allocator");
+                   Callee->getName() == "calloc" ||
+                   Callee->getName() == "realloc" && "Unknown allocator");
             auto *TotalSize = CS.getArgument(0);
-            // OMFG
             if (Callee->getName() == "calloc")
               TotalSize = BinaryOperator::CreateNSWMul(
                   TotalSize, CS.getArgument(1), "", &*I);
+            else if (Callee->getName() == "realloc")
+              TotalSize = CS.getArgument(1);
 
             if (Targets.count(N)) {
               DEBUG(errs() << "--- rewriting alloc\n");
@@ -1906,7 +2048,26 @@ void LayoutTuner::applyTransformation(
               Value *Size, *SizeInBytes, *Base;
               std::tie(Size, SizeInBytes) = computeAllocSize(
                   TotalSize, N, Transforms.at(GroupId).get(), &*I);
-              Base = rewriteAlloc(CS, SizeInBytes, &*I, "base");
+              if (Callee->getName() != "realloc")
+                Base = rewriteAlloc(CS, SizeInBytes, &*I, "base");
+              else {
+                Value *OldPtr, *OldSize;
+                const DSNode *OldN =
+                    getNodeForValue(CS.getArgument(0), F).getNode();
+                if (Targets.count(OldN)) {
+                  assert(OldN == N);
+                  auto OldTriple = TripleMap.at(CS.getArgument(0));
+                  OldPtr = OldTriple.Base;
+                  OldSize = OldTriple.Size;
+                } else {
+                  OldPtr = ConstantPointerNull::get(Int8PtrTy);
+                  OldSize = ConstantInt::get(Int64Ty, 0);
+                }
+                auto *Realloc = getRealloc(Transforms.at(GroupId).get(), &M);
+                Base = CallInst::Create(
+                    Realloc, std::vector<Value *>{OldPtr, Size, OldSize},
+                    I->getName(), &*I);
+              }
 
               // fingers crossed an integer is either 64 bit or less
               if (Size->getType() != Int64Ty)
@@ -1919,8 +2080,9 @@ void LayoutTuner::applyTransformation(
               //
               // rewrite the allocation of type that got triple-converted
               //
-              unsigned SizeNeeded =
-                  computeSizeWithTripleConv(Refs.getOrigNode(N), Targets);
+              DEBUG(errs() << "N = " << N
+                           << ", ORIG N = " << Refs.getOrigNode(N) << '\n');
+              unsigned SizeNeeded = computeSizeWithTripleConv(N, Refs);
               if (SizeNeeded != N->getSize()) {
                 assert(SizeNeeded > N->getSize());
                 auto *SizeTy = TotalSize->getType();
@@ -1942,16 +2104,37 @@ void LayoutTuner::applyTransformation(
             auto *Ptr = CS.getArgument(0);
             if (Targets.count(getNodeForValue(Ptr, F).getNode())) {
               DEBUG(errs() << "--- rewriting dealloc\n");
-              assert(CS.getNumArgOperands() == 1);
-              std::vector<Value *> DeallocArgs = {Ptr};
+              assert(CS.getNumArgOperands() == 1 &&
+                     "What kind of deallocator is this???");
+              assert(TripleMap.count(Ptr) &&
+                     "Triple not found for target to be decallocated");
+              std::vector<Value *> DeallocArgs = {TripleMap.at(Ptr).Base};
               if (auto *Invoke = dyn_cast<InvokeInst>(CS.getInstruction()))
                 InvokeInst::Create(Callee, Invoke->getNormalDest(),
                                    Invoke->getUnwindDest(), DeallocArgs, "",
                                    &*I);
+              else
+                CallInst::Create(Callee, DeallocArgs, "", &*I);
+              removeValue(&*I);
             }
-            removeValue(&*I);
             continue;
           } // end of handling allocation
+
+          if (Callee->getIntrinsicID() == Intrinsic::memcpy) {
+            DSNodeHandle NH = getNodeForValue(CS.getArgument(0), F),
+                         MH = getNodeForValue(CS.getArgument(1), F);
+            if (!Refs.refersTargets(NH.getNode()))
+              continue;
+            assert(NH.getNode() == MH.getNode());
+            assert(NH.getOffset() == MH.getOffset());
+            assert(Offsets.lookup(NH.getNode()) + NH.getOffset() == 0);
+            assert(cast<ConstantInt>(CS.getArgument(2))->getZExtValue() ==
+                   Refs.getOrigNode(NH.getNode())->getSize());
+            auto *NewSize =
+                ConstantInt::get(CS.getArgument(2)->getType(),
+                                 computeSizeWithTripleConv(NH.getNode(), Refs));
+            I->getOperandUse(2).set(NewSize);
+          }
 
           if (Callee->empty())
             continue;
@@ -1962,9 +2145,9 @@ void LayoutTuner::applyTransformation(
           auto *CallerG = getDSGraph(F), *CalleeG = getDSGraph(Callee);
           // propagate targets from caller to callee
           // also propagate the group tag
-          TargetMapTy TargetsInCallee = TransTargets;
+          TargetMapTy TargetsInCallee;
           RefSetTracker<TargetMapTy> CalleeRefs;
-          OffsetMapTy CalleeOffsets = DefaultOffsets;
+          OffsetMapTy CalleeOffsets;
           bool SameSCC = (DSA->getCallGraph().sccLeader(getSrcFunc(F)) ==
                           DSA->getCallGraph().sccLeader(getSrcFunc(Callee)));
           DEBUG(errs() << F->getName() << " and " << Callee->getName()
@@ -1974,39 +2157,46 @@ void LayoutTuner::applyTransformation(
           for (auto Mapping : CalleeCallerMapping) {
             auto *CalleeN = Mapping.first;
             auto *CallerN = Mapping.second.getNode();
-
-            //assert(!SameSCC || Mapping.second.getOffset() == 0);
-            DEBUG(errs() << "CALLER N = " << CallerN << '\n');
             auto It = Targets.find(CallerN);
             if (It != Targets.end()) {
               unsigned GroupId = It->second;
-              DEBUG(errs() << "TARGET MAPPING " << CallerN << " -> " << CalleeN
-                           << ", GROUP ID = " << GroupId << '\n');
               TargetsInCallee[CalleeN] = GroupId;
               CalleeOffsets[CalleeN] =
                   Offsets.lookup(CallerN) + Mapping.second.getOffset();
+              assert(Offsets.lookup(CallerN) + Mapping.second.getOffset() <
+                     Transforms.at(GroupId)->getSize());
+            }
+          }
+
+          CloneSignature Sig(TargetsInCallee, CalleeOffsets,
+                             getSrcFunc(Callee));
+          for (auto TargetAndGroup : TransTargets) {
+            const DSNode *N = TargetAndGroup.first;
+            if (N->getParentGraph() == CalleeG && !TargetsInCallee.count(N)) {
+              TargetsInCallee[N] = TargetAndGroup.second;
+              CalleeOffsets[N] = 0;
             }
           }
           CalleeRefs =
               Refs.getCalleeTracker(TargetsInCallee, CalleeCallerMapping);
 
           if (shouldCloneFunction(Callee, CalleeRefs)) {
-            DEBUG(errs() << "--- need to clone callee\n");
-            auto *CloneFnTy = computeCloneFnTy(CS, Refs);
+            DEBUG(errs() << "--- need to clone callee for call"
+                << *I
+                << "\n");
+            auto *CloneFnTy = computeCloneFnTy(Callee, CalleeRefs);
             DEBUG(errs() << "--- inferred new callee type after cloning: "
                          << *CloneFnTy << '\n');
 
             Function *Clone;
-            CloneSignature Sig(TargetsInCallee, CalleeOffsets, getSrcFunc(Callee));
             // maybe we have a clone for this use already
-            const auto CloneIt =
-                CloneCache.find(Sig);
+            const auto CloneIt = CloneCache.find(Sig);
             if (CloneIt != CloneCache.end())
               Clone = CloneIt->second;
             else {
               DEBUG(errs() << "--- cloning " << Callee->getName() << '\n');
-              Clone = cloneFunctionWithNewType(Callee, CloneFnTy,
-                                               TargetsInCallee, TripleMap, Sig);
+              Clone = cloneFunction(Callee, CloneFnTy, TargetsInCallee,
+                                    TripleMap, Sig, Targets.count(N));
               DEBUG(errs() << "-- cloned function: " << Clone->getName()
                            << '\n');
               // we haven't processed this new clone
@@ -2017,25 +2207,6 @@ void LayoutTuner::applyTransformation(
             // compute the list of arguments with which we call the clone
             //
             std::vector<Value *> NewArgs;
-            unsigned i = 0;
-            for (Value *Arg : CS.args()) {
-              if (Targets.count(getNodeForValue(Arg, F).getNode())) {
-                DEBUG(errs() << "Looking up triple for " << *Arg << "\n");
-                auto &Triple = TripleMap.at(Arg);
-                assert(Triple.Base);
-                NewArgs.push_back(Triple.Base);
-                NewArgs.push_back(Triple.Idx);
-                NewArgs.push_back(Triple.Size);
-                i += 3;
-              } else {
-                auto *ParamTy = CloneFnTy->params()[i++];
-                if (Arg->getType() != ParamTy)
-                  Arg = CastInst::CreatePointerCast(Arg, ParamTy,
-                                                    Arg->getName(), &*I);
-                NewArgs.push_back(Arg);
-              }
-            }
-
             //
             // if the original function call returns pointer to Target
             // we need to return by reference
@@ -2043,6 +2214,7 @@ void LayoutTuner::applyTransformation(
             AllocaInst *BaseAddr, *IdxAddr, *SizeAddr;
             bool ReturnsTarget = Targets.count(
                 getNodeForValue(CS.getInstruction(), F).getNode());
+            unsigned i = 0;
             if (ReturnsTarget) {
               // allocate 3 slots on stack for the callee to set return value of
               // the triple
@@ -2053,13 +2225,31 @@ void LayoutTuner::applyTransformation(
               NewArgs.push_back(BaseAddr);
               NewArgs.push_back(IdxAddr);
               NewArgs.push_back(SizeAddr);
+              i = 3;
+            }
+            for (Value *Arg : CS.args()) {
+              if (Targets.count(getNodeForValue(Arg, F).getNode())) {
+                DEBUG(errs() << "Looking up triple for " << *Arg << "\n");
+                auto &Triple = TripleMap.at(Arg);
+                assert(Triple.Base);
+                NewArgs.push_back(Triple.Base);
+                NewArgs.push_back(Triple.Idx);
+                NewArgs.push_back(Triple.Size);
+                i += 3;
+              } else {
+                if (i < CloneFnTy->params().size()) {
+                  auto *ParamTy = CloneFnTy->params()[i++];
+                  if (Arg->getType() != ParamTy)
+                    Arg = CastInst::CreatePointerCast(Arg, ParamTy,
+                                                      Arg->getName(), &*I);
+                }
+                NewArgs.push_back(Arg);
+              }
             }
 
             //
             // call the clone
             //
-            assert(Clone->getFunctionType()->getNumParams() == NewArgs.size() &&
-                   "mismatch of args in new call");
             Value *NewCall;
             if (auto *Invoke = dyn_cast<InvokeInst>(&*I))
               NewCall =
@@ -2072,7 +2262,7 @@ void LayoutTuner::applyTransformation(
             // use the call to the clone instead of the old one
             //
             if (!ReturnsTarget) {
-              I->mutateType(NewCall->getType());
+              updateType(&*I, NewCall->getType());
               I->replaceAllUsesWith(NewCall);
               removeValue(&*I);
             } else {
@@ -2112,8 +2302,8 @@ void LayoutTuner::applyTransformation(
 
             assert(TripleMap.count(RetVal));
             auto &Triple = TripleMap.at(RetVal);
-            auto SizeAddr = F->getArgumentList().rbegin(),
-                 IdxAddr = std::next(SizeAddr), BaseAddr = std::next(IdxAddr);
+            auto BaseAddr = F->getArgumentList().begin(),
+                 IdxAddr = std::next(BaseAddr), SizeAddr = std::next(IdxAddr);
 
             new StoreInst(
                 CastInst::CreatePointerCast(Triple.Base, Int8PtrTy, "", RI),
@@ -2172,8 +2362,7 @@ void LayoutTuner::applyTransformation(
           if (!Refs.refersTargets(N))
             continue;
 
-          unsigned SizeNeeded =
-              computeSizeWithTripleConv(Refs.getOrigNode(N), Targets);
+          unsigned SizeNeeded = computeSizeWithTripleConv(N, Refs);
 
           auto *TyAfterConv =
               cast<PointerType>(getNewType(AI, NH, Refs))->getElementType();
@@ -2197,14 +2386,17 @@ void LayoutTuner::applyTransformation(
             // = alloca i8, i64 size_in_bytes`.
             //
             if (TD->getTypeAllocSize(AllocatedType) == N->getSize() &&
-                TD->getTypeAllocSize(NewAllocatedType) == SizeNeeded) {
+                TD->getTypeAllocSize(NewAllocatedType) >= SizeNeeded) {
               // case 1
               // this is the easy one, we just change the type being allocated
               NewAlloca =
                   new AllocaInst(TyAfterConv, AI->getArraySize(), "", AI);
             } else {
-              DEBUG(errs() << *AI << ", " << *AllocatedType << ", "
-                           << *NewAllocatedType << '\n');
+              DEBUG(errs() << "OLD ALLOCA " << *AI << "\n\t, OLD TYPE"
+                           << *AllocatedType << ", NEW TYPE"
+                           << *NewAllocatedType << ", OLD SIZE " << N->getSize()
+                           << ", NEW SIZE "
+                           << TD->getTypeAllocSize(NewAllocatedType) << '\n');
               // case 2
               // need to calculate number of bytes needed
               assert(AI->getAllocatedType() == Int8Ty &&
@@ -2244,7 +2436,7 @@ void LayoutTuner::applyTransformation(
               auto &Triple = TripleMap.at(OrigOp);
               assert(Transforms.count(GroupId));
               auto *Addr = Transforms.at(GroupId)->ComputeAddress(
-                  Triple, Offset, ICMP, true);
+                  Triple, Offset, ICMP, true /* don't care */);
               auto *Ptr = CastInst::CreatePointerCast(Addr, Ty,
                                                       OrigOp->getName(), ICMP);
               ICMP->getOperandUse(i).set(Ptr);
@@ -2273,41 +2465,19 @@ void LayoutTuner::applyTransformation(
 }
 
 FunctionType *
-LayoutTuner::computeCloneFnTy(CallSite CS,
+LayoutTuner::computeCloneFnTy(Function *F,
                               const RefSetTracker<TargetMapTy> &Refs) {
   DEBUG(errs() << "----- computing clone fn ty\n");
-
-  Function *Caller = CS.getParent()->getParent(),
-           *Callee = CS.getCalledFunction();
-  assert(Callee);
-
-  DEBUG(errs() << "---- getting function type for function "
-               << Callee->getName() << '\n');
-  auto *OrigTy = Callee->getFunctionType();
+  DEBUG(errs() << "---- getting function type for function " << F->getName()
+               << '\n');
+  auto *OrigTy = F->getFunctionType();
   std::vector<Type *> ArgTypes;
 
-  DEBUG(errs() << "--- deducing input args for clone\n");
-  unsigned NumArgs = OrigTy->getNumParams();
-  for (unsigned i = 0; i < NumArgs; i++) {
-    Value *Arg = CS.getArgument(i);
-    auto *ArgN = getNodeForValue(Arg, Caller).getNode();
-
-    if (Refs.getTargets().count(ArgN)) {
-      // expand the pointer to target into triple
-      ArgTypes.push_back(Int8PtrTy);
-      ArgTypes.push_back(Int64Ty);
-      ArgTypes.push_back(Int64Ty);
-    } else {
-      ArgTypes.push_back(getNewType(const_cast<Value *>(getOrigValue(Arg)),
-                                    getNodeForValue(Arg, Caller), Refs));
-    }
-  }
-
-  auto NH = getNodeForValue(CS.getInstruction(), Caller);
+  DSNodeHandle RetNH = getDSGraph(F)->getReturnNodeFor(*F);
 
   DEBUG(errs() << "---- deducing return type for clone\n");
   Type *RetTy;
-  if (Refs.getTargets().count(NH.getNode())) {
+  if (Refs.getTargets().count(RetNH.getNode())) {
     // in case the function returns a pointer to target
     // we append 3 extra return arguments to set the triple begin "returned"
     RetTy = VoidTy;
@@ -2315,11 +2485,44 @@ LayoutTuner::computeCloneFnTy(CallSite CS,
     ArgTypes.push_back(PointerType::getUnqual(Int64Ty));
     ArgTypes.push_back(PointerType::getUnqual(Int64Ty));
   } else if (OrigTy->getReturnType() != VoidTy) {
-    RetTy = getNewType(CS.getInstruction(), NH, Refs);
+    RetTy = getNewType(RetNH.getNode(), Refs, OrigTy->getReturnType(),
+                       RetNH.getOffset());
   } else
     RetTy = VoidTy;
 
-  return FunctionType::get(RetTy, ArgTypes, false /*isVarArg*/);
+  DEBUG(errs() << "--- deducing input args for clone\n");
+  for (auto &Arg : F->args()) {
+    DSNodeHandle ArgNH = getNodeForValue(&Arg, F);
+    auto *ArgN = ArgNH.getNode();
+
+    if (Refs.getTargets().count(ArgN)) {
+      // expand the pointer to target into triple
+      ArgTypes.push_back(Int8PtrTy);
+      ArgTypes.push_back(Int64Ty);
+      ArgTypes.push_back(Int64Ty);
+    } else {
+      if (!ArgN) {
+        ArgTypes.push_back(Arg.getType());
+        continue;
+      }
+
+      bool HasRef = false;
+      for (unsigned Offset = ArgNH.getOffset(); Offset < ArgN->getSize();
+           Offset++)
+        if (Refs.hasRefAt(ArgN, Offset)) {
+          HasRef = true;
+          break;
+        }
+      if (HasRef) {
+        ArgTypes.push_back(
+            getNewType(const_cast<Value *>(getOrigValue(&Arg)), ArgN, Refs));
+      } else {
+        ArgTypes.push_back(Arg.getType());
+      }
+    }
+  }
+
+  return FunctionType::get(RetTy, ArgTypes, F->getFunctionType()->isVarArg());
 }
 
 bool LayoutTuner::shouldCloneFunction(
@@ -2348,7 +2551,8 @@ bool LayoutTuner::shouldCloneFunction(
   return false;
 }
 
-// FIXME: need to remove nodes refered by type-unsafe node
+// FIXME: need to propagate Refs so that we can make sure indirect calls don't
+// touch refs as well (since these refs's layout will be changed as well)
 TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   std::vector<const DSNode *> Candidates;
   auto &TypeChecker = getAnalysis<TypeSafety<EquivBUDataStructures>>();
@@ -2359,18 +2563,31 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
   std::map<const DSNode *, std::set<unsigned>> NodesWithZeroOffset;
   std::set<unsigned> Disqualified;
 
-  auto IsLegalTarget = [&TypeChecker](const DSNode *N) -> bool {
-    if (N->isGlobalNode() || N->isIntToPtrNode() || N->getSize() < MinSize ||
-        !TypeChecker.isTypeSafe(N))
+  auto IsLegalTarget = [this, &TypeChecker](const DSNode *N) -> bool {
+    if (N->isGlobalNode() || N->getSize() < MinSize ||
+       (ArrayOnly && !N->isArrayNode()) ||
+       !TypeChecker.isTypeSafe(N))
       return false;
 
-    // don't mess with fields that are composite types
-    for (auto ti = N->type_begin(), te = N->type_end(); ti != te; ++ti)
+    unsigned BytesUsed = 0;
+    // don't mess with fields that are composite types or union
+    for (auto ti = N->type_begin(), te = N->type_end(); ti != te; ++ti) {
+      if (ti->second->size() != 1)
+        return false;
       for (Type *Ty : *ti->second)
         if (isa<CompositeType>(Ty))
           return false;
+        else if (NoPointer && Ty->isPointerTy())
+          return false;
+        else if (NoFP)
+          if (auto *Pointer = dyn_cast<PointerType>(Ty))
+            if (Pointer->getElementType()->isFunctionTy())
+              return false;
 
-    return std::distance(N->type_begin(), N->type_end()) > 0;
+      BytesUsed += TD->getTypeAllocSize(*ti->second->begin());
+    }
+
+    return std::distance(N->type_begin(), N->type_end()) >= MinFields;
   };
 
   auto FindTargetsReferred =
@@ -2474,14 +2691,14 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           if (!Targets.count(CallerNH.getNode()))
             continue;
 
-          auto OffsetIt = RelOffsets.find({CallerNH.getNode(), CalleeN});
           auto &TargetIds = Targets.at(CallerNH.getNode());
-          if (OffsetIt != RelOffsets.end() &&
-              OffsetIt->second != CallerNH.getOffset()) {
-            // we've already found this mapping
-            // check that their's only one relative offset
-            insertInto(Disqualified, TargetIds);
-          }
+          // auto OffsetIt = RelOffsets.find({CallerNH.getNode(), CalleeN});
+          // if (false && OffsetIt != RelOffsets.end() &&
+          //    OffsetIt->second != CallerNH.getOffset()) {
+          //  // we've already found this mapping
+          //  // check that their's only one relative offset
+          //  insertInto(Disqualified, TargetIds);
+          //}
 
           RelOffsets[{CallerNH.getNode(), CalleeN}] = CallerNH.getOffset();
 
@@ -2501,6 +2718,8 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
     FirstPass = false;
   } while (Changed);
 
+  RefSetTracker<decltype(GlobalTargets)> GGRefs(GlobalTargets);
+
   // There are certain patterns of global pointer to targets that we support
   // filter out those that aren't. These cases are rare and not worth supporting
   // for now...
@@ -2513,18 +2732,17 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
     std::set<unsigned> GlobalsReferred;
     FindTargetsReferred(N, GlobalsReferred);
 
-    if (!GlobalsReferred.empty()) {
+    if (!GlobalsReferred.empty() && !N->isCollapsedNode()) {
       // for now, to simplify transformation,
       // we support handling global that refers to target
       // only if the global is declared with type infered by DSA
-      unsigned SizeNeeded = computeSizeWithTripleConv(N, GlobalTargets);
+      unsigned SizeNeeded = computeSizeWithTripleConv(N, GGRefs);
 
       auto *TyAfterConv =
           cast<PointerType>(
-              getNewType(const_cast<GlobalVariable *>(&G), NH,
-                         RefSetTracker<decltype(GlobalTargets)>(GlobalTargets)))
+              getNewType(const_cast<GlobalVariable *>(&G), NH, GGRefs))
               ->getElementType();
-      if (TD->getTypeAllocSize(TyAfterConv) != SizeNeeded) {
+      if (true || TD->getTypeAllocSize(TyAfterConv) != SizeNeeded) {
         insertInto(Disqualified, GlobalsReferred);
         continue;
       }
@@ -2535,7 +2753,8 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           insertInto(Disqualified, GlobalsReferred);
           continue;
         }
-    }
+    } else if (N->isCollapsedNode())
+      insertInto(Disqualified, GlobalsReferred);
   }
 
   // 1) make sure that a gep either
@@ -2581,7 +2800,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           //
           // make sure no indirect call can access any target
           //
-          if (!CS.getCalledFunction() || CS.isInvoke()) {
+          if (!CS.getCalledFunction()) {
             DenseSet<const DSNode *> ReachableNodes;
             auto *RetN = G->getNodeForValue(CS.getInstruction()).getNode();
             if (RetN)
@@ -2609,7 +2828,7 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
           }
 
           //
-          // make sure we don't pass a target to memcpy, memmove, and memset
+          // make sure we don't pass a target to memmove, and memset
           //
           std::set<unsigned> TargetsUsed;
           auto It = Targets.find(G->getNodeForValue(&I).getNode());
@@ -2630,11 +2849,26 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
             continue;
 
           auto *Callee = CS.getCalledFunction();
-          bool HasDefinition =
-              Callee && (isDeallocator(Callee) || isAllocator(Callee) ||
-                         !Callee->isDeclarationForLinker());
-          if (!Callee || !HasDefinition || isUnsupportedLibCall(Callee)) {
+          bool Supported =
+              Callee && (!Callee->isDeclarationForLinker() || isDeallocator(Callee) ||
+              isAllocator(Callee) ||
+              Callee->getIntrinsicID() == Intrinsic::lifetime_start ||
+              Callee->getIntrinsicID() == Intrinsic::lifetime_end ||
+              Callee->getIntrinsicID() == Intrinsic::memcpy);
+          if (!Supported) {
             insertInto(Disqualified, TargetsUsed);
+          } else if (Callee->getIntrinsicID() == Intrinsic::memcpy) {
+            const DSNode *N = G->getNodeForValue(CS.getArgument(0)).getNode();
+            if (!refersTargets(N, Targets) && !Targets.count(N))
+              continue;
+            if (Targets.count(N))
+              insertInto(Disqualified, Targets.at(N));
+            else if (!isa<ConstantInt>(CS.getArgument(2)))
+              FindTargetsReferred(N, Disqualified);
+          } else if (Callee->getName() == "realloc") {
+            const DSNode *N = G->getNodeForValue(CS.getArgument(0)).getNode();
+            if (!Targets.count(N))
+              insertInto(Disqualified, TargetsUsed);
           }
         } else if (auto *IV = dyn_cast<InsertValueInst>(&I)) {
           auto *N = G->getNodeForValue(IV->getAggregateOperand()).getNode();
@@ -2663,6 +2897,11 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
             insertInto(Disqualified, It->second);
           if (N)
             FindTargetsReferred(N, Disqualified);
+        } else if (auto *PTI = dyn_cast<PtrToIntInst>(&I)) {
+          auto *N = G->getNodeForValue(PTI->getPointerOperand()).getNode();
+          auto It = Targets.find(N);
+          if (It != Targets.end())
+            insertInto(Disqualified, It->second);
         }
   }
 
@@ -2679,20 +2918,20 @@ TargetMapTy LayoutTuner::findLegalTargets(const Module &M) {
     }
   }
 
-  DEBUG(errs() << "NUM DISQUALIFIED: " << Disqualified.size() << '\n');
+  errs() << "NUM DISQUALIFIED " << Disqualified.size() << '\n';
 
   TargetMapTy LegalTargets;
   for (unsigned i = 0, e = Candidates.size(); i != e; i++)
     if (!Disqualified.count(i)) {
       auto *N = Candidates[i];
+      unsigned GroupId = LegalTargets.size();
       if (N->getParentGraph() == GG)
-        DEBUG(errs() << "GROUP " << LegalTargets.size()
-                     << " is in globals graph\n");
+        DEBUG(errs() << "GROUP " << GroupId << " is in globals graph\n");
       else
-        DEBUG(errs() << "GROUP " << LegalTargets.size() << " is in SCC of "
+        DEBUG(errs() << "GROUP " << GroupId << " is in SCC of "
                      << N->getParentGraph()->retnodes_begin()->first->getName()
                      << "(G= " << N->getParentGraph() << ")\n");
-      LegalTargets[Candidates[i]] = LegalTargets.size();
+      LegalTargets[Candidates[i]] = GroupId;
     }
 
   return LegalTargets;
@@ -2714,6 +2953,13 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  errs() << "OUT = " << OutputFilename << '\n';
+
+  legacy::PassManager Passes;
+  Passes.add(new LayoutTuner());
+  Passes.add(createVerifierPass());
+  Passes.run(*M);
+
   std::error_code EC;
   tool_output_file Out(OutputFilename, EC, sys::fs::F_None);
   if (EC) {
@@ -2721,11 +2967,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  legacy::PassManager Passes;
-  Passes.add(new LayoutTuner());
-  Passes.add(createBitcodeWriterPass(Out.os(), true));
-  Passes.add(createVerifierPass());
-  Passes.run(*M);
+  WriteBitcodeToFile(M.get(), Out.os());
 
   Out.keep();
 }

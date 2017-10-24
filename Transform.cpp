@@ -1,40 +1,73 @@
-#include <llvm/Support/raw_ostream.h>
 #include "Transform.h"
+#include <llvm/Support/raw_ostream.h>
 
 using namespace llvm;
 
-static unsigned rand(unsigned Min, unsigned Max) {
+namespace {
+
+void resetEverything(LayoutDataType *Layout) {
+  if (auto *Struct = dyn_cast<LayoutStruct>(Layout)) {
+    for (auto &F : Struct->getFields())
+      resetEverything(F.second.get());
+    Struct->reset();
+  }
+}
+
+unsigned rand(unsigned Min, unsigned Max) {
   return Min + std::rand() % (Max - Min);
 }
 
-static double randProb() {
-  return std::rand() / double(RAND_MAX);
+double randProb() {
+  static std::default_random_engine Ngn;
+  static std::uniform_real_distribution<double> Dist(0.0, 1.0);
+  return Dist(Ngn);
 }
 
-static std::pair<unsigned, unsigned> choose2(unsigned Num) {
+std::pair<unsigned, unsigned> choose2(unsigned Num) {
   unsigned A = rand(0, Num), B;
-  do B = rand(0, Num); while (A == B);
+  do
+    B = rand(0, Num);
+  while (A == B);
   return {A, B};
 }
 
-LayoutDataType *LayoutTransform::select(LayoutDataType *Layout, std::vector<LayoutDataType *> &Parents) const {
-  auto *Struct = dyn_cast<LayoutStruct>(Layout);
+} // end anonymous namespace
 
-  // got nothing to select from
-  if (!Struct) {
-    return Layout;
+LayoutDataType *
+LayoutTransform::select(LayoutDataType *Layout,
+                        std::vector<LayoutDataType *> &Parents) const {
+  //  auto *Struct = dyn_cast<LayoutStruct>(Layout);
+  //
+  //  // got nothing to select from
+  //  if (!Struct) {
+  //    return Layout;
+  //  }
+  //
+  //
+  // double p = randProb();
+  // if (p < TransformParams::PRoot) {
+  //  return Layout;
+  //}
+
+  // auto Fields = Struct->getFields();
+  // auto *SubLayout = Fields[rand(0, Fields.size())].second.get();
+  // Parents.push_back(Layout);
+  // return select(SubLayout, Parents);
+  std::vector<LayoutDataType *> Nodes;
+  std::vector<LayoutDataType *> Worklist = {Layout};
+  while (!Worklist.empty()) {
+    LayoutDataType *Layout = Worklist.back();
+    Worklist.pop_back();
+    auto *Struct = dyn_cast<LayoutStruct>(Layout);
+    if (Struct) {
+      for (auto &F : Struct->getFields())
+        Worklist.push_back(F.second.get());
+      Nodes.push_back(Layout);
+      assert(isa<LayoutStruct>(Layout) && "WTF");
+    } else if (WorksOnScalar)
+      Nodes.push_back(Layout);
   }
-
-
-  double p = randProb();
-  if (p < TransformParams::PRoot) {
-    return Layout;
-  }
-
-  auto Fields = Struct->getFields();
-  auto *SubLayout = Fields[rand(0, Fields.size())].second.get();
-  Parents.push_back(Layout);
-  return select(SubLayout, Parents);
+  return Nodes[rand(0, Nodes.size())];
 }
 
 std::unique_ptr<LayoutDataType>
@@ -44,12 +77,12 @@ LayoutTransform::apply(const LayoutDataType &Layout) const {
   std::vector<LayoutDataType *> Parents;
   auto *SubLayout = select(NewLayout.get(), Parents);
   transform(SubLayout);
-  for (auto It = Parents.rbegin(), E = Parents.rend(); It != E; ++It)
-    cast<LayoutStruct>(*It)->reset();
+  resetEverything(NewLayout.get());
   return NewLayout;
 }
 
-void TransformPool::addTransform(std::unique_ptr<LayoutTransform> Transform, float Prob) {
+void TransformPool::addTransform(std::unique_ptr<LayoutTransform> Transform,
+                                 float Prob) {
   assert(Prob <= 1 && "Probability is greater than 1");
 
   if (Probs.empty()) {
@@ -65,7 +98,8 @@ void TransformPool::addTransform(std::unique_ptr<LayoutTransform> Transform, flo
   Transforms.push_back(std::move(Transform));
 }
 
-std::unique_ptr<LayoutDataType> TransformPool::apply(const LayoutDataType &Layout) const {
+std::unique_ptr<LayoutDataType>
+TransformPool::apply(const LayoutDataType &Layout) const {
   double p = randProb();
   for (unsigned i = 0, e = Probs.size(); i != e; i++)
     if (Probs[i] > p)
